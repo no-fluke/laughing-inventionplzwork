@@ -1,8 +1,10 @@
 """
 ╔══════════════════════════════════════════════════════╗
 ║         AppX / Parmar Academy Downloader             ║
-║           Telegram Bot Edition — v1.0                ║
+║           Telegram Bot Edition — v1.1                ║
 ║   Merged from Termux v3.8 + Saini Bot Template       ║
+║   Fixes: MESSAGE_ID_INVALID on 2nd item,             ║
+║          mp4 downloads missing Referer/UA headers    ║
 ╚══════════════════════════════════════════════════════╝
 
 COMMANDS:
@@ -101,6 +103,10 @@ PDF_HEADERS = {
     "Connection":      "Keep-Alive",
 }
 
+# Headers required by AppX CDN for EVERY byte-range of mp4/HLS media
+MEDIA_REFERER = "https://player-strict.akamai.net.in/"
+MEDIA_UA      = "Dalvik/2.1.0 (Linux; U; Android 11; RMX2001 Build/RP1A.200720.011)"
+
 cookies_file_path = os.getenv("cookies_file_path", "youtube_cookies.txt")
 
 # ══════════════════════════════════════════════════════
@@ -120,6 +126,36 @@ cancel_requested   = {}
 BUTTONS_CONTACT = InlineKeyboardMarkup([[
     InlineKeyboardButton(text="📞 Contact", url=f"tg://openmessage?user_id={OWNER}")
 ]])
+
+# ══════════════════════════════════════════════════════
+#  SAFE PROGRESS-MESSAGE EDIT
+#  ─ helper.send_vid() deletes the progress message at the
+#    end of each upload, so editing it on the NEXT iteration
+#    raises MESSAGE_ID_INVALID. This wrapper recreates it.
+# ══════════════════════════════════════════════════════
+
+async def safe_progress_edit(bot_client, chat_id, msg, text, **kwargs):
+    """
+    Edit a progress message. If it was deleted (e.g. by
+    helper.send_vid after upload), a new one is sent & pinned
+    and returned so the caller can keep using it.
+    """
+    try:
+        await msg.edit_text(text, **kwargs)
+        return msg
+    except Exception:
+        try:
+            await msg.delete()
+        except Exception:
+            pass
+        new_msg = await bot_client.send_message(chat_id, text, **kwargs)
+        try:
+            await bot_client.pin_chat_message(
+                chat_id, new_msg.id, disable_notification=True
+            )
+        except Exception:
+            pass
+        return new_msg
 
 # ══════════════════════════════════════════════════════
 #  AES / XOR DECRYPTION (from termux script)
@@ -443,17 +479,25 @@ def _is_mp4_url(url: str) -> bool:
 
 
 def _mp4_headers(url: str) -> dict:
-    lower = url.lower()
-    if "appx-content-v2.classx.co.in" in lower:
-        return {
-            **APPX_HEADERS,
-            "Referer":    "https://player-strict.akamai.net.in/",
-            "User-Agent": "Dalvik/2.1.0 (Linux; U; Android 11; RMX2001 Build/RP1A.200720.011)",
-        }
-    return {
-        "Referer":    "https://player-strict.akamai.net.in/",
-        "User-Agent": "Dalvik/2.1.0 (Linux; U; Android 11; RMX2001 Build/RP1A.200720.011)",
+    """
+    Headers for a direct mp4 fetch — only ONE User-Agent key
+    (lowercase from APPX_HEADERS was colliding with the uppercase one,
+    causing the server to reject subsequent ranges).
+    """
+    base = {
+        "Referer":    MEDIA_REFERER,
+        "User-Agent": MEDIA_UA,
     }
+    if "appx-content-v2.classx.co.in" in url.lower():
+        return {
+            "client-service":       "Appx",
+            "auth-key":             "appxapi",
+            "language":             "en",
+            "device-type":          "ANDROID",
+            "x-tenant-app-version": "420",
+            **base,   # exactly one User-Agent, one Referer
+        }
+    return base
 
 
 def _best_download_link(d: dict, prefer_quality: str = "720p") -> str:
@@ -698,7 +742,7 @@ def _strip_html(raw: str) -> str:
     return re.sub(r'\s+', ' ', text).strip()
 
 
-def save_quiz_txt(questions: list, out_path: str, title: str) -> str | None:
+def save_quiz_txt(questions: list, out_path: str, title: str):
     if not questions:
         return None
     out = f"{out_path}_quiz.txt"
@@ -828,7 +872,7 @@ async def fetch_testseries_questions(session, api_base, test: dict, hdr) -> list
 #  TOOL DETECTION
 # ══════════════════════════════════════════════════════
 
-def _find_tool(*candidates: str) -> str | None:
+def _find_tool(*candidates: str):
     for name in candidates:
         found = shutil.which(name)
         if found:
@@ -855,7 +899,7 @@ def safe_filename(name: str, idx: int = None) -> str:
 #  HLS FRAGMENT DOWNLOADER
 # ══════════════════════════════════════════════════════
 
-async def hls_fragment_download(url: str, out_path: str) -> str | None:
+async def hls_fragment_download(url: str, out_path: str):
     from urllib.parse import urljoin
     out_mp4 = f"{out_path}.mp4"
     tmp_dir = tempfile.mkdtemp(prefix="hls_frags_")
@@ -955,7 +999,7 @@ async def hls_fragment_download(url: str, out_path: str) -> str | None:
 # ══════════════════════════════════════════════════════
 
 async def ytdlp_download(url: str, out_path: str,
-                         extra_headers: dict = None) -> str | None:
+                         extra_headers: dict = None):
     if not _YTDLP:
         return None
     hdr_args = []
@@ -966,8 +1010,8 @@ async def ytdlp_download(url: str, out_path: str,
     base_args = [
         _YTDLP,
         "--no-check-certificate",
-        "-R", "5",
-        "--fragment-retries", "10",
+        "-R", "25",
+        "--fragment-retries", "25",
         "--hls-use-mpegts",
         "-o", f"{out_path}.%(ext)s",
     ] + hdr_args
@@ -997,11 +1041,11 @@ async def ytdlp_download(url: str, out_path: str,
     return None
 
 
-async def ffmpeg_download(url: str, out_path: str) -> str | None:
+async def ffmpeg_download(url: str, out_path: str):
     if not _FFMPEG:
         return None
     out = f"{out_path}.mp4"
-    referer = CDN_HEADERS["Referer"]
+    referer = MEDIA_REFERER
     proc = await asyncio.create_subprocess_exec(
         _FFMPEG, "-y",
         "-headers", f"Referer: {referer}\r\nOrigin: https://player-strict.akamai.net.in\r\n",
@@ -1016,7 +1060,7 @@ async def ffmpeg_download(url: str, out_path: str) -> str | None:
     return None
 
 
-async def download_pdf(url: str, out_path: str) -> str | None:
+async def download_pdf(url: str, out_path: str):
     out = f"{out_path}.pdf"
     try:
         connector = aiohttp.TCPConnector(ssl=False)
@@ -1042,7 +1086,7 @@ async def download_pdf(url: str, out_path: str) -> str | None:
     return None
 
 
-async def direct_stream_download(url: str, out_path: str) -> str | None:
+async def direct_stream_download(url: str, out_path: str):
     mp4_hdrs = _mp4_headers(url)
     out      = f"{out_path}.mp4"
 
@@ -1055,15 +1099,29 @@ async def direct_stream_download(url: str, out_path: str) -> str | None:
                     timeout=aiohttp.ClientTimeout(total=3600, connect=15, sock_read=60)) as resp:
                 if resp.status not in (200, 206):
                     return None
+                expected = int(resp.headers.get("Content-Length") or 0)
+                written  = 0
                 async with aiofiles.open(out, "wb") as f:
                     async for chunk in resp.content.iter_chunked(65536):
                         await f.write(chunk)
+                        written += len(chunk)
+                if expected and written < expected:
+                    print(f"[Direct] Truncated: {written}/{expected} bytes — discarding")
+                    try:
+                        os.remove(out)
+                    except Exception:
+                        pass
+                    return None
         if os.path.exists(out) and os.path.getsize(out) > 1024:
             return out
     except Exception as e:
         print(f"[Direct] aiohttp failed: {e}")
+        try:
+            os.remove(out)
+        except Exception:
+            pass
 
-    # Method 2: yt-dlp
+    # Method 2: yt-dlp WITH headers (the path that actually works)
     if _YTDLP:
         res = await ytdlp_download(url, out_path, extra_headers=mp4_hdrs)
         if res:
@@ -1072,36 +1130,35 @@ async def direct_stream_download(url: str, out_path: str) -> str | None:
 
 
 async def _download_single_url(url: str, vtype: str, xor_key: str,
-                               out_path: str) -> str | None:
+                               out_path: str):
     if _is_drm_url(url):
         print(f"[Download] Skipping DRM URL: {url[:80]}")
         return None
 
+    media_headers = {
+        "Referer":    MEDIA_REFERER,
+        "User-Agent": MEDIA_UA,
+    }
+
     if _is_mp4_url(url) or url.lower().split("?")[0].endswith(".mp4"):
-        result = await direct_stream_download(url, out_path)
-        if not result and _YTDLP:
-            result = await ytdlp_download(url, out_path, extra_headers=_mp4_headers(url))
+        # yt-dlp with headers is the primary path — it handles ranges correctly
+        result = await ytdlp_download(url, out_path, extra_headers=_mp4_headers(url))
+        if not result:
+            result = await direct_stream_download(url, out_path)
     elif ".m3u8" in url.lower():
-        result = await ytdlp_download(url, out_path, extra_headers={
-            "Referer": CDN_HEADERS["Referer"],
-            "Origin":  "https://player-strict.akamai.net.in",
-        })
+        result = await ytdlp_download(url, out_path, extra_headers=media_headers)
         if not result:
             result = await ffmpeg_download(url, out_path)
         if not result:
             result = await hls_fragment_download(url, out_path)
     elif is_direct_video_url(url):
-        result = await direct_stream_download(url, out_path)
+        result = await ytdlp_download(url, out_path, extra_headers=media_headers)
         if not result:
-            result = await ytdlp_download(url, out_path, extra_headers={
-                "Referer": CDN_HEADERS["Referer"],
-            })
+            result = await direct_stream_download(url, out_path)
         if not result:
             result = await ffmpeg_download(url, out_path)
     else:
-        result = await ytdlp_download(url, out_path, extra_headers={
-            "Referer": CDN_HEADERS["Referer"],
-        })
+        result = await ytdlp_download(url, out_path, extra_headers=media_headers)
         if not result:
             result = await direct_stream_download(url, out_path)
         if not result:
@@ -1383,7 +1440,8 @@ async def download_test_series(bot_client: Client, m: Message,
                 os.makedirs(out_dir, exist_ok=True)
             out_path = os.path.join(out_dir, safe_filename(tname, i))
 
-            await prog.edit_text(
+            prog = await safe_progress_edit(
+                bot_client, m.chat.id, prog,
                 f"🧪 **Test {i}/{total}**\n"
                 f"`{tname[:60]}`\n"
                 f"📁 Subject: {subj}"
@@ -1407,7 +1465,8 @@ async def download_test_series(bot_client: Client, m: Message,
                 failed += 1
             await asyncio.sleep(0.5)
 
-        await prog.edit_text(
+        prog = await safe_progress_edit(
+            bot_client, m.chat.id, prog,
             f"✅ **Test Series Complete: {sname}**\n"
             f"✓ Saved: {success}  ✗ Failed: {failed}"
         )
@@ -1623,7 +1682,10 @@ async def appx_main_flow(bot_client: Client, m: Message, user_id_tg: int):
                 subject = lec.get("_subject", "")
                 topic   = lec.get("_topic", "")
 
-                await prog_msg.edit_text(
+                # safe_progress_edit recreates prog_msg if helper.send_vid
+                # deleted it during the previous iteration.
+                prog_msg = await safe_progress_edit(
+                    bot_client, channel_id, prog_msg,
                     f"<blockquote>"
                     f"🚀 Progress: {i}/{total} ({i*100//total}%)\n"
                     f"📚 Title: {title[:50]}\n"
@@ -1765,17 +1827,35 @@ async def appx_main_flow(bot_client: Client, m: Message, user_id_tg: int):
 
                 # ── Handle regular video (HLS / MP4 / encrypted) ─────────
                 if 'encrypted.m' in (url or ""):
-                    appxkey = url.split('*')[1]
-                    url     = url.split('*')[0]
+                    appxkey  = url.split('*')[1]
+                    url      = url.split('*')[0]
                     res_file = await helper.download_and_decrypt_video(url, "", out_path, appxkey)
                 else:
-                    # Build yt-dlp command for helper.download_video
                     q_num = prefer_quality.replace("p", "")
                     ytf   = f"b[height<={q_num}]/bv[height<={q_num}]+ba/b/bv+ba"
-                    if ".m3u8" in (url or "") or "akamaized" in (url or "") or "fastly" in (url or ""):
-                        cmd = f'yt-dlp -f "{ytf}" --concurrent-fragments 16 --no-part "{url}" -o "{out_path}.mp4"'
+
+                    # Every AppX CDN byte-range requires Referer + UA,
+                    # otherwise follow-up ranges 403 and the file truncates.
+                    header_args = (
+                        f'--add-header "Referer: {MEDIA_REFERER}" '
+                        f'--add-header "User-Agent: {MEDIA_UA}" '
+                    )
+
+                    if _is_mp4_url(url) or url.lower().split("?")[0].endswith(".mp4"):
+                        # Direct mp4 (pre-signed static-db / appx-content-v2)
+                        cmd = (
+                            f'yt-dlp {header_args} '
+                            f'-f "{ytf}" -R 25 --fragment-retries 25 '
+                            f'"{url}" -o "{out_path}.mp4"'
+                        )
                     else:
-                        cmd = f'yt-dlp -f "{ytf}" "{url}" -o "{out_path}.mp4"'
+                        # HLS / m3u8 — same headers, plus fragment concurrency
+                        cmd = (
+                            f'yt-dlp {header_args} '
+                            f'-f "{ytf}" --concurrent-fragments 16 --no-part '
+                            f'-R 25 --fragment-retries 25 '
+                            f'"{url}" -o "{out_path}.mp4"'
+                        )
                     res_file = await helper.download_video(url, cmd, out_path)
 
                 if res_file:
@@ -1790,7 +1870,6 @@ async def appx_main_flow(bot_client: Client, m: Message, user_id_tg: int):
                         hdr=hdr, class_pdfs=class_pdfs, want_pdf=want_pdf,
                         all_candidates=all_candidates)
                     if ok:
-                        # Find the downloaded file and send it
                         for ext in ["mp4", "mkv", "webm", "ts"]:
                             fpath = f"{out_path}.{ext}"
                             if os.path.exists(fpath):
