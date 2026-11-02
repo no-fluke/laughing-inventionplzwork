@@ -241,13 +241,12 @@ async def appx_login(bot_client: Client, m: Message, api_base: str):
     Interactive AppX login via Telegram bot conversation.
     Returns (token, user_id, user_name) or (None, None, None).
     """
-    keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("1️⃣ Email/Password", callback_data="appx_login_1"),
-         InlineKeyboardButton("2️⃣ JWT Token", callback_data="appx_login_2")]
-    ])
     ask = await m.reply_text(
-        "**🔐 AppX Login**\n\nChoose login method:",
-        reply_markup=keyboard
+        "**🔐 AppX Login**\n\n"
+        "Choose login method:\n"
+        "**1** — Email / Password\n"
+        "**2** — JWT Token\n\n"
+        "Reply with `1` or `2`"
     )
 
     try:
