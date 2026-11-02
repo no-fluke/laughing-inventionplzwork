@@ -1,0 +1,17 @@
+pyrogram==2.0.106
+pyromod==0.2.4
+tgcrypto
+aiohttp
+aiofiles
+pycryptodome
+requests
+pymongo[srv]
+certifi
+colorama
+cloudscraper
+beautifulsoup4
+m3u8
+yt-dlp
+pytube
+pytz
+ffmpeg-python
