@@ -736,7 +736,10 @@ def duration(filename):
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
     )
-    return float(result.stdout)
+    try:
+        return float(result.stdout)
+    except (ValueError, TypeError):
+        return 0
 
 def get_mps_and_keys(api_url):
     response = requests.get(api_url)
