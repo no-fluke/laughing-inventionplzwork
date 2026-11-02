@@ -1,5 +1,5 @@
 pyrogram==2.0.106
-pyromod==0.2.4
+pyromod==1.5
 tgcrypto
 aiohttp
 aiofiles
