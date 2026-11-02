@@ -1503,7 +1503,7 @@ async def appx_main_flow(bot_client: Client, m: Message, user_id_tg: int):
 
             # ── Test Series ────────────────────────────────────────────────
             if dl_choice == "5":
-                course_dir = "downloads"
+                course_dir = os.path.join(tempfile.gettempdir(), "downloads")
                 os.makedirs(course_dir, exist_ok=True)
                 await download_test_series(
                     bot_client, m, session, api_base,
@@ -1607,7 +1607,7 @@ async def appx_main_flow(bot_client: Client, m: Message, user_id_tg: int):
             except Exception:
                 pass
 
-            downloads_dir = "downloads"
+            downloads_dir = os.path.join(tempfile.gettempdir(), "downloads")
             os.makedirs(downloads_dir, exist_ok=True)
 
             # ── Lecture loop ──────────────────────────────────────────────
@@ -2226,7 +2226,7 @@ if __name__ == "__main__":
     notify_owner()
 
 load_cookies_from_db()
-os.makedirs("downloads", exist_ok=True)
+os.makedirs(os.path.join(tempfile.gettempdir(), "downloads"), exist_ok=True)
 
 print("\033[92m✓ AppX Downloader Bot starting…\033[0m")
 bot.run()
