@@ -15,3 +15,11 @@ yt-dlp
 pytube
 pytz
 ffmpeg-python
+
+# ─── Web server (keepalive dyno) ───────────────────────────────────────────────
+Flask==2.3.3
+gunicorn==21.2.0
+Werkzeug==2.3.7
+
+# ─── Stability fix ─────────────────────────────────────────────────────────────
+setuptools<81
