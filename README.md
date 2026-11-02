@@ -1,6 +1,6 @@
 # AppX Course Downloader — Telegram Bot
 
-[![Deploy to Heroku](https://www.herokucdn.com/deploy/button.svg)](https://heroku.com/deploy?template=https://github.com/YOUR_USERNAME/YOUR_REPO)
+[![Deploy to Heroku](https://www.herokucdn.com/deploy/button.svg)](https://heroku.com/deploy?template=https://github.com/no-fluke/laughing-inventionplzwork).
 
 Converts the Termux v3.8 AppX/Parmar Academy downloader into a full Telegram bot, 
 built on the Saini Bot template.
