@@ -53,7 +53,7 @@ from Crypto.Util.Padding import unpad
 from logs import logging
 import saini as helper
 from utils import progress_bar
-from vars import API_ID, API_HASH, BOT_TOKEN, OWNER, CREDIT, AUTH_USERS, TOTAL_USERS, VIMEO_WORKER_URL
+from vars import API_ID, API_HASH, BOT_TOKEN, OWNER, CREDIT, AUTH_USERS, TOTAL_USERS, VIMEO_WORKER_URL, APPX_PROXY_WORKER_URL, APPX_PROXY_TOKEN
 from db import db
 from auth import (
     add_user_cmd, remove_user_cmd, list_users_cmd, my_plan_cmd,
@@ -1200,20 +1200,36 @@ async def download_pdf(url: str, out_path: str):
     return None
 
 
+def _proxy_url(target_url: str) -> str:
+    """
+    Wrap a CDN URL through the Cloudflare proxy Worker so that
+    geo-restricted CDNs (static-db.appx.co.in etc.) see an Indian
+    edge IP instead of the bot-server's data-centre IP.
+    Returns the original URL unchanged when the Worker is not configured.
+    """
+    if not APPX_PROXY_WORKER_URL:
+        return target_url
+    encoded = urllib.parse.quote(target_url, safe="")
+    return f"{APPX_PROXY_WORKER_URL.rstrip('/')}/proxy?url={encoded}&token={APPX_PROXY_TOKEN}"
+
+
 async def direct_stream_download(url: str, out_path: str):
     """
     aiohttp with 1 MB chunks. Builds headers itself so no duplication.
-    Works for static-db.appx.co.in because we control exactly which
-    headers are sent.
+    Routes through the Cloudflare proxy Worker when configured so that
+    geo-restricted CDNs (static-db.appx.co.in) see an Indian edge IP.
     """
-    mp4_hdrs = _mp4_headers(url)
-    out      = f"{out_path}.mp4"
+    fetch_url = _proxy_url(url)
+    # When proxying, the Worker adds the CDN headers itself;
+    # send plain headers to the Worker to avoid duplication.
+    mp4_hdrs  = {} if fetch_url != url else _mp4_headers(url)
+    out       = f"{out_path}.mp4"
 
     try:
         connector = aiohttp.TCPConnector(ssl=False, limit=4, keepalive_timeout=60)
         async with aiohttp.ClientSession(connector=connector) as dl_sess:
             async with dl_sess.get(
-                    url, headers=mp4_hdrs,
+                    fetch_url, headers=mp4_hdrs,
                     timeout=aiohttp.ClientTimeout(total=3600, connect=15, sock_read=90)) as resp:
                 if resp.status == 404:
                     print(f"[Direct] 404 — URL expired or rejected")
