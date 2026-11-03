@@ -6,7 +6,6 @@
 ║     1. Multi-PDF per lecture (class_pdfs[1:] skip)  ║
 ║     2. MP4 URL freshness check + 1MB chunk aiohttp  ║
 ║     3. Option 6 — Download EVERYTHING in one shot   ║
-║     4. MP4 external downloader fix (aria2c/curl)    ║
 ╚══════════════════════════════════════════════════════╝
 
 COMMANDS:
@@ -53,7 +52,7 @@ from Crypto.Util.Padding import unpad
 from logs import logging
 import saini as helper
 from utils import progress_bar
-from vars import API_ID, API_HASH, BOT_TOKEN, OWNER, CREDIT, AUTH_USERS, TOTAL_USERS, VIMEO_WORKER_URL, APPX_PROXY_WORKER_URL, APPX_PROXY_TOKEN
+from vars import API_ID, API_HASH, BOT_TOKEN, OWNER, CREDIT, AUTH_USERS, TOTAL_USERS, VIMEO_WORKER_URL
 from db import db
 from auth import (
     add_user_cmd, remove_user_cmd, list_users_cmd, my_plan_cmd,
@@ -133,6 +132,11 @@ BUTTONS_CONTACT = InlineKeyboardMarkup([[
 # ══════════════════════════════════════════════════════
 
 async def safe_progress_edit(bot_client, chat_id, msg, text, **kwargs):
+    """
+    Edit a progress message. If it was deleted (e.g. by helper.send_vid
+    after upload), send a new one and return it so the caller can keep
+    using it.
+    """
     try:
         await msg.edit_text(text, **kwargs)
         return msg
@@ -469,6 +473,10 @@ def _is_mp4_url(url: str) -> bool:
 
 
 def _mp4_headers(url: str) -> dict:
+    """
+    Exactly ONE User-Agent and ONE Referer — duplicate keys cause the CDN
+    to reject subsequent byte-range requests with 403.
+    """
     base = {
         "Referer":    MEDIA_REFERER,
         "User-Agent": MEDIA_UA,
@@ -579,6 +587,11 @@ def _resolve_pdf_url(pdf_link: str, pdf_key: str) -> str:
 
 
 def _extract_class_pdfs(d: dict) -> list:
+    """
+    Returns list of (suffix, url) for ALL PDFs on a lecture item.
+    Both pdf_link and pdf_link2 are extracted.
+    e.g. [("", url1), ("_2", url2)]
+    """
     pdfs = []
     p1  = _resolve_pdf_url(d.get("pdf_link",  ""), d.get("pdf_encryption_key",  ""))
     p2  = _resolve_pdf_url(d.get("pdf_link2", ""), d.get("pdf2_encryption_key", ""))
@@ -862,7 +875,6 @@ def _find_tool(*candidates: str):
 _YTDLP  = _find_tool("yt-dlp", "yt_dlp")
 _FFMPEG = _find_tool("ffmpeg")
 _ARIA2C = _find_tool("aria2c")
-_CURL   = _find_tool("curl")
 
 # ══════════════════════════════════════════════════════
 #  FILENAME HELPERS
@@ -883,16 +895,9 @@ def safe_filename(name: str, idx: int = None) -> str:
 async def _check_url_fresh(url: str, headers: dict, timeout: int = 8) -> bool:
     """
     HEAD request to verify a signed CDN URL is still alive before
-    committing a slow downloader. Skipped for signed URLs (Signature=,
-    Expires=) because static-db.appx.co.in rejects HEAD on signed URLs
-    even when GET works fine.
+    committing a slow downloader. Returns False immediately on 403/404
+    so we don't waste time on all 5 download methods for a dead URL.
     """
-    # Skip HEAD check for signed CDN URLs — they reject HEAD with 403/404
-    # even when GET works. Termux works because it goes straight to GET.
-    if any(p in url for p in ("Signature=", "Expires=", "token=", "auth=")):
-        print(f"[URL-check] Signed URL — skipping HEAD check, going straight to download")
-        return True
-
     try:
         connector = aiohttp.TCPConnector(ssl=False)
         async with aiohttp.ClientSession(connector=connector) as s:
@@ -1014,118 +1019,13 @@ async def hls_fragment_download(url: str, out_path: str):
 
 async def ytdlp_download(url: str, out_path: str,
                          extra_headers: dict = None):
-    """
-    FIX 4: For direct MP4 URLs (static-db.appx.co.in etc.) yt-dlp's
-    internal downloader sends its own default headers ON TOP of
-    --add-header, causing duplicate Referer/User-Agent which makes
-    the CDN return 404.
-
-    Fix: use aria2c or curl as external downloader for MP4 URLs.
-    They send ONLY the headers you specify — nothing extra.
-    Referer and User-Agent are passed via both --add-header (yt-dlp
-    level) and --downloader-args (aria2c/curl level) so they are
-    always present regardless of which layer handles the request.
-    """
     if not _YTDLP:
         return None
-
-    # Build --add-header args (used for all URL types)
     hdr_args = []
     if extra_headers:
         for k, v in extra_headers.items():
             hdr_args += ["--add-header", f"{k}:{v}"]
-
     EXTS = ["mp4", "mkv", "webm", "ts", "m4v"]
-
-    def _find_result():
-        for ext in EXTS:
-            p = f"{out_path}.{ext}"
-            if os.path.exists(p) and os.path.getsize(p) > 1024:
-                return p
-        return None
-
-    async def _run(*args) -> int:
-        try:
-            proc = await asyncio.create_subprocess_exec(*args)
-            return await proc.wait()
-        except FileNotFoundError:
-            return -1
-
-    is_mp4 = _is_mp4_url(url) or url.lower().split("?")[0].endswith(".mp4")
-
-    if is_mp4:
-        # ── MP4: must use external downloader to avoid duplicate headers ──
-
-        # Method 1: aria2c (fastest, sends headers exactly as specified)
-        if _ARIA2C:
-            # Build aria2c header string — one --header= per header
-            aria2c_hdr_str = ""
-            if extra_headers:
-                for k, v in extra_headers.items():
-                    aria2c_hdr_str += f"--header={k}: {v} "
-
-            ret = await _run(
-                _YTDLP,
-                "--no-check-certificate",
-                "-R", "25",
-                "--fragment-retries", "25",
-                "-o", f"{out_path}.%(ext)s",
-                *hdr_args,
-                "--external-downloader", "aria2c",
-                "--downloader-args",
-                f"aria2c:-x 16 -k 1M --retry-wait=3 --max-tries=5 {aria2c_hdr_str.strip()}",
-                url
-            )
-            if ret == 0:
-                result = _find_result()
-                if result:
-                    print(f"[ytdlp/aria2c] ✓ Downloaded: {os.path.basename(result)}")
-                    return result
-
-        # Method 2: curl (also sends exactly specified headers)
-        if _CURL:
-            curl_hdr_str = ""
-            if extra_headers:
-                for k, v in extra_headers.items():
-                    curl_hdr_str += f"-H \"{k}: {v}\" "
-
-            ret = await _run(
-                _YTDLP,
-                "--no-check-certificate",
-                "-R", "25",
-                "--fragment-retries", "25",
-                "-o", f"{out_path}.%(ext)s",
-                *hdr_args,
-                "--external-downloader", "curl",
-                "--downloader-args",
-                f"curl:{curl_hdr_str.strip()} --retry 5 --retry-delay 3 --retry-max-time 60",
-                url
-            )
-            if ret == 0:
-                result = _find_result()
-                if result:
-                    print(f"[ytdlp/curl] ✓ Downloaded: {os.path.basename(result)}")
-                    return result
-
-        # Method 3: yt-dlp native fallback (may work on some CDNs)
-        ret = await _run(
-            _YTDLP,
-            "--no-check-certificate",
-            "-R", "25",
-            "--fragment-retries", "25",
-            "-o", f"{out_path}.%(ext)s",
-            *hdr_args,
-            url
-        )
-        if ret == 0:
-            result = _find_result()
-            if result:
-                print(f"[ytdlp/native] ✓ Downloaded: {os.path.basename(result)}")
-                return result
-
-        return None
-
-    # ── HLS / other URLs: original logic (internal downloader is fine) ────
     base_args = [
         _YTDLP,
         "--no-check-certificate",
@@ -1135,24 +1035,28 @@ async def ytdlp_download(url: str, out_path: str,
         "-o", f"{out_path}.%(ext)s",
     ] + hdr_args
 
+    async def _run(*args) -> int:
+        try:
+            proc = await asyncio.create_subprocess_exec(*args)
+            return await proc.wait()
+        except FileNotFoundError:
+            return -1
+
     if _ARIA2C:
-        ret = await _run(
-            *base_args,
+        ret = await _run(*base_args,
             "--external-downloader", "aria2c",
             "--downloader-args", "aria2c:-x 16 -j 32 -k 1M",
-            url
-        )
+            url)
         if ret == 0:
-            result = _find_result()
-            if result:
-                return result
+            for ext in EXTS:
+                if os.path.exists(f"{out_path}.{ext}"):
+                    return f"{out_path}.{ext}"
 
-    ret = await _run(*base_args, url)
-    if ret == 0:
-        result = _find_result()
-        if result:
-            return result
-
+    ret2 = await _run(*base_args, url)
+    if ret2 == 0:
+        for ext in EXTS:
+            if os.path.exists(f"{out_path}.{ext}"):
+                return f"{out_path}.{ext}"
     return None
 
 
@@ -1200,42 +1104,25 @@ async def download_pdf(url: str, out_path: str):
     return None
 
 
-def _proxy_url(target_url: str) -> str:
-    """
-    Wrap a CDN URL through the Cloudflare proxy Worker so that
-    geo-restricted CDNs (static-db.appx.co.in etc.) see an Indian
-    edge IP instead of the bot-server's data-centre IP.
-    Returns the original URL unchanged when the Worker is not configured.
-    """
-    if not APPX_PROXY_WORKER_URL:
-        return target_url
-    encoded = urllib.parse.quote(target_url, safe="")
-    return f"{APPX_PROXY_WORKER_URL.rstrip('/')}/proxy?url={encoded}&token={APPX_PROXY_TOKEN}"
-
-
 async def direct_stream_download(url: str, out_path: str):
     """
-    aiohttp with 1 MB chunks. Builds headers itself so no duplication.
-    Routes through the Cloudflare proxy Worker when configured so that
-    geo-restricted CDNs (static-db.appx.co.in) see an Indian edge IP.
+    FIX 2: aiohttp with 1 MB chunks (up from 64 KB) and a truncation
+    check. Detects expired URLs via 404 mid-stream and returns None
+    immediately rather than saving a corrupt partial file.
     """
-    fetch_url = _proxy_url(url)
-    # When proxying, the Worker adds the CDN headers itself;
-    # send plain headers to the Worker to avoid duplication.
-    mp4_hdrs  = {} if fetch_url != url else _mp4_headers(url)
-    out       = f"{out_path}.mp4"
+    mp4_hdrs = _mp4_headers(url)
+    out      = f"{out_path}.mp4"
 
     try:
         connector = aiohttp.TCPConnector(ssl=False, limit=4, keepalive_timeout=60)
         async with aiohttp.ClientSession(connector=connector) as dl_sess:
             async with dl_sess.get(
-                    fetch_url, headers=mp4_hdrs,
+                    url, headers=mp4_hdrs,
                     timeout=aiohttp.ClientTimeout(total=3600, connect=15, sock_read=90)) as resp:
                 if resp.status == 404:
-                    print(f"[Direct] 404 — URL expired or rejected")
+                    print(f"[Direct] 404 — URL expired")
                     return None
                 if resp.status not in (200, 206):
-                    print(f"[Direct] HTTP {resp.status}")
                     return None
                 expected   = int(resp.headers.get("Content-Length") or 0)
                 downloaded = 0
@@ -1243,7 +1130,8 @@ async def direct_stream_download(url: str, out_path: str):
                 start_t    = time.time()
 
                 async with aiofiles.open(out, "wb") as f:
-                    async for chunk in resp.content.iter_chunked(1048576):  # 1 MB
+                    # 1 MB chunks — fills TCP window properly on fast CDN
+                    async for chunk in resp.content.iter_chunked(1048576):
                         await f.write(chunk)
                         downloaded += len(chunk)
                         now = time.time()
@@ -1260,25 +1148,27 @@ async def direct_stream_download(url: str, out_path: str):
                             last_log = now
                 print()
 
+                # Truncation check — discard if we got less than 98% of expected
                 actual = os.path.getsize(out) if os.path.exists(out) else 0
                 if expected and actual < expected * 0.98:
                     print(f"[Direct] Truncated ({actual/(1024*1024):.1f} MB "
                           f"of {expected/(1024*1024):.1f} MB) — discarding")
-                    try:
-                        os.remove(out)
-                    except Exception:
-                        pass
+                    try: os.remove(out)
+                    except Exception: pass
                     return None
 
         if os.path.exists(out) and os.path.getsize(out) > 1024:
             return out
     except Exception as e:
         print(f"[Direct] aiohttp failed: {e}")
-        try:
-            os.remove(out)
-        except Exception:
-            pass
+        try: os.remove(out)
+        except Exception: pass
 
+    # yt-dlp fallback WITH correct headers
+    if _YTDLP:
+        res = await ytdlp_download(url, out_path, extra_headers=mp4_hdrs)
+        if res:
+            return res
     return None
 
 
@@ -1296,37 +1186,19 @@ async def _download_single_url(url: str, vtype: str, xor_key: str,
     if _is_mp4_url(url) or url.lower().split("?")[0].endswith(".mp4"):
         mp4_hdrs = _mp4_headers(url)
 
-        # Signed CDN URLs (Signature= / static-db.appx.co.in) must NOT go
-        # through yt-dlp at all: yt-dlp makes an internal info-extraction
-        # GET before handing off to aria2c, and that request adds its own
-        # default headers on top of --add-header, giving the CDN a
-        # mismatched header set → 404.  Pure aiohttp sends exactly the
-        # headers we build — nothing more — so use it as the primary method
-        # for signed URLs and only fall back to yt-dlp if it fails.
-        is_signed = any(p in url for p in ("Signature=", "Expires=", "token=", "auth="))
-
-        if is_signed:
-            # Primary: aiohttp (exact header control)
-            result = await direct_stream_download(url, out_path)
-            if result:
-                return result
-            # Fallback: yt-dlp native (no external downloader — avoids the
-            # double-request that aria2c mode introduces)
-            result = await ytdlp_download(url, out_path, extra_headers=mp4_hdrs)
-            if result:
-                return result
-            return None
-
-        # Unsigned MP4 — original order: yt-dlp first, aiohttp fallback
+        # FIX 2: Check URL is alive before trying any downloader
+        print(f"[MP4] Checking URL freshness…")
         if not await _check_url_fresh(url, mp4_hdrs):
-            print(f"[MP4] URL check failed — skipping")
+            print(f"[MP4] URL is dead (403/404) — skipping")
             return None
 
-        result = await ytdlp_download(url, out_path, extra_headers=mp4_hdrs)
+        # Method 1: aiohttp with 1 MB chunks (fastest start, no subprocess)
+        result = await direct_stream_download(url, out_path)
         if result:
             return result
 
-        result = await direct_stream_download(url, out_path)
+        # Method 2: yt-dlp with correct headers
+        result = await ytdlp_download(url, out_path, extra_headers=mp4_hdrs)
         if result:
             return result
 
@@ -1338,14 +1210,12 @@ async def _download_single_url(url: str, vtype: str, xor_key: str,
             result = await ffmpeg_download(url, out_path)
         if not result:
             result = await hls_fragment_download(url, out_path)
-
     elif is_direct_video_url(url):
         result = await ytdlp_download(url, out_path, extra_headers=media_headers)
         if not result:
             result = await direct_stream_download(url, out_path)
         if not result:
             result = await ffmpeg_download(url, out_path)
-
     else:
         result = await ytdlp_download(url, out_path, extra_headers=media_headers)
         if not result:
@@ -1401,7 +1271,7 @@ async def download_item(title: str, url: str, xor_key: str, vtype: str,
         size = os.path.getsize(result) / (1024 * 1024)
         print(f"[Download] ✓ Saved: {os.path.basename(result)} ({size:.1f} MB)")
 
-    # FIX 1 — download ALL class PDFs
+    # FIX 1 — download ALL class PDFs, not just the first one
     if want_pdf and class_pdfs:
         for suffix, pdf_url in class_pdfs:
             if not pdf_url:
@@ -1541,6 +1411,11 @@ async def download_test_series(bot_client: Client, m: Message,
                                channel_id: int = None,
                                cname: str = "",
                                auto_all: bool = False):
+    """
+    Download test series.  auto_all=True skips the pick prompts and
+    downloads every series / subject / test automatically (used by
+    the Download Everything flow — option 6).
+    """
     channel_id = channel_id or m.chat.id
     status = await m.reply_text("⏳ Fetching test series list…")
     series_list = await get_test_series_list(session, api_base, user_id, cid, hdr)
@@ -1700,6 +1575,11 @@ async def run_lecture_loop(
     start_idx: int,
     downloads_dir: str,
 ):
+    """
+    The inner loop that downloads lectures.  Extracted so both the
+    single-mode flow and the Download-Everything flow can share it.
+    Returns (success, failed) counts.
+    """
     success = failed = 0
     total   = len(lectures)
 
@@ -1737,7 +1617,7 @@ async def run_lecture_loop(
         name     = safe_filename(title, i)
         out_path = os.path.join(downloads_dir, name)
 
-        # ── Quiz detection ───────────────────────────────────────────
+        # ── Quiz detection ──────────────────────────────────────────
         QUIZ_TYPES = {"QUIZ", "TEST", "ATTEMPT", "EXERCISE", "ASSIGNMENT"}
         _raw_qid   = str(lec.get("quiz_title_id") or lec.get("quiz_id") or "")
         _has_quiz  = (
@@ -1772,7 +1652,7 @@ async def run_lecture_loop(
                     "quiz" in mat.lower() and mat.upper() != "VIDEO"):
                 continue
 
-        # ── Resolve URL ──────────────────────────────────────────────
+        # ── Resolve URL ─────────────────────────────────────────────
         vtitle, url, xor_key, vtype, class_pdfs, all_candidates = \
             await resolve_video(
                 session, api_base, cid, lec_id, hdr,
@@ -1793,8 +1673,9 @@ async def run_lecture_loop(
             f"Extracted by ➤ {CREDIT}"
         )
 
-        # ── FIX 1: PDF-type items with ALL attached PDFs ─────────────
+        # ── FIX 1: handle PDF-type items with ALL attached PDFs ─────
         if vtype == "pdf" and want_pdf:
+            # url is class_pdfs[0] when vtype=="pdf" — download it directly
             pr = await download_pdf(url, out_path)
             if pr:
                 await bot_client.send_document(channel_id, document=pr, caption=cc1)
@@ -1803,6 +1684,8 @@ async def run_lecture_loop(
             else:
                 failed += 1
 
+            # Extra PDFs (class_pdfs[1:]) — primary was already the first entry
+            # so we skip index 0 to avoid re-downloading it.
             for idx2, (suffix, purl) in enumerate(class_pdfs, start=2):
                 if not purl:
                     continue
@@ -1821,6 +1704,7 @@ async def run_lecture_loop(
             continue
 
         if vtype not in ("pdf",) and not want_video:
+            # Still send class PDFs even when skipping video
             if want_pdf and class_pdfs:
                 for suffix, purl in class_pdfs:
                     if not purl:
@@ -1831,7 +1715,7 @@ async def run_lecture_loop(
                         os.remove(pr)
             continue
 
-        # ── YouTube ──────────────────────────────────────────────────
+        # ── YouTube ─────────────────────────────────────────────────
         if vtype == "youtube":
             ytf = f"bv*[height<={prefer_quality[:-1]}][ext=mp4]+ba[ext=m4a]/b[height<=?{prefer_quality[:-1]}]"
             cmd = (
@@ -1853,39 +1737,38 @@ async def run_lecture_loop(
             await asyncio.sleep(1)
             continue
 
-        # ── Regular video (HLS / MP4 / encrypted) ────────────────────
+        # ── Regular video (HLS / MP4 / encrypted) ───────────────────
         if 'encrypted.m' in (url or ""):
             appxkey  = url.split('*')[1]
             url      = url.split('*')[0]
             res_file = await helper.download_and_decrypt_video(url, "", out_path, appxkey)
         else:
+            q_num = prefer_quality.replace("p", "")
+            ytf   = f"b[height<={q_num}]/bv[height<={q_num}]+ba/b/bv+ba"
+            header_args = (
+                f'--add-header "Referer: {MEDIA_REFERER}" '
+                f'--add-header "User-Agent: {MEDIA_UA}" '
+            )
             if _is_mp4_url(url) or url.lower().split("?")[0].endswith(".mp4"):
-                mp4_hdrs = _mp4_headers(url)
-                # Signed CDN URLs (Signature= etc.): aiohttp first — yt-dlp's
-                # info-extraction pass adds extra headers that cause 404.
-                if any(p in url for p in ("Signature=", "Expires=", "token=", "auth=")):
-                    res_file = await direct_stream_download(url, out_path)
-                    if not res_file:
-                        res_file = await ytdlp_download(url, out_path, extra_headers=mp4_hdrs)
-                else:
-                    res_file = await ytdlp_download(url, out_path, extra_headers=mp4_hdrs)
-                    if not res_file:
-                        res_file = await direct_stream_download(url, out_path)
+                cmd = (
+                    f'yt-dlp {header_args} '
+                    f'-f "{ytf}" -R 25 --fragment-retries 25 '
+                    f'"{url}" -o "{out_path}.mp4"'
+                )
             else:
-                # HLS/m3u8 — no -f flag; let yt-dlp auto-pick the best stream.
-                # (ytf / -f must NOT be passed for non-YouTube URLs: yt-dlp
-                # would try to fetch a format manifest that doesn't exist on a
-                # plain MP4/HLS CDN and get a 404.)
-                res_file = await ytdlp_download(url, out_path, extra_headers={
-                    "Referer":    MEDIA_REFERER,
-                    "User-Agent": MEDIA_UA,
-                })
+                cmd = (
+                    f'yt-dlp {header_args} '
+                    f'-f "{ytf}" --concurrent-fragments 16 --no-part '
+                    f'-R 25 --fragment-retries 25 '
+                    f'"{url}" -o "{out_path}.mp4"'
+                )
+            res_file = await helper.download_video(url, cmd, out_path)
 
         if res_file:
             await helper.send_vid(
                 bot_client, m, cc, res_file, "/d", name,
                 prog_msg, channel_id, watermark_text=batch_watermark)
-            # FIX 1: send class PDFs attached to this video lecture
+            # FIX 1: also send class PDFs attached to this video lecture
             if want_pdf and class_pdfs:
                 for suffix, purl in class_pdfs:
                     if not purl:
@@ -1925,7 +1808,7 @@ async def run_lecture_loop(
 # ══════════════════════════════════════════════════════
 
 async def appx_main_flow(bot_client: Client, m: Message, user_id_tg: int):
-    # ── Step 1: API Domain ────────────────────────────────────────────
+    # ── Step 1: API Domain ────────────────────────────────────────────────
     domain_ask = await m.reply_text(
         "**🌐 Enter API Domain**\n\n"
         "<blockquote>Examples:\n"
@@ -1948,7 +1831,7 @@ async def appx_main_flow(bot_client: Client, m: Message, user_id_tg: int):
 
     api_base = (f"https://{api_raw}" if not api_raw.startswith("http") else api_raw)
 
-    # ── Step 2: Login ─────────────────────────────────────────────────
+    # ── Step 2: Login ─────────────────────────────────────────────────────
     token, appx_user_id, user_name = await appx_login(bot_client, m, api_base)
     if not token:
         return
@@ -1956,7 +1839,7 @@ async def appx_main_flow(bot_client: Client, m: Message, user_id_tg: int):
     hdr = make_headers(token, appx_user_id)
     await m.reply_text(f"✅ **Authenticated as:** `{user_name}`")
 
-    # ── Step 3: Fetch courses ──────────────────────────────────────────
+    # ── Step 3: Fetch courses ─────────────────────────────────────────────
     status = await m.reply_text("⏳ Fetching your courses…")
     async with aiohttp.ClientSession() as session:
         courses = await get_courses(session, api_base, appx_user_id, hdr)
@@ -1984,7 +1867,7 @@ async def appx_main_flow(bot_client: Client, m: Message, user_id_tg: int):
 
             await m.reply_text(f"**📚 Course: {cname}**")
 
-            # ── Download type ──────────────────────────────────────────
+            # ── Download type ──────────────────────────────────────────────
             dl_type_ask = await m.reply_text(
                 "**What to download?**\n\n"
                 "`1` — Videos only\n"
@@ -2004,7 +1887,7 @@ async def appx_main_flow(bot_client: Client, m: Message, user_id_tg: int):
                 dl_choice = "3"
                 await dl_type_ask.delete()
 
-            # ── Upload destination & watermark ─────────────────────────
+            # ── Common: upload destination & watermark (shared by all modes) ─
             chan_ask = await m.reply_text(
                 "**Upload to channel/group?**\n"
                 "Send Channel ID (e.g. `-100xxxxxxxxxx`) or `/d` to upload here.\n"
@@ -2063,6 +1946,7 @@ async def appx_main_flow(bot_client: Client, m: Message, user_id_tg: int):
                     "No further prompts — starting now…"
                 )
 
+                # Quality for videos
                 q_ask = await m.reply_text(
                     "**Video quality?**\n"
                     "`1` 1080p  `2` 720p (default)  `3` 480p\n"
@@ -2079,12 +1963,15 @@ async def appx_main_flow(bot_client: Client, m: Message, user_id_tg: int):
                     prefer_quality = "720p"
                     await q_ask.delete()
 
+                # ── Phase 1: all lectures (video + PDF + quiz) ─────────────
                 await bot_client.send_message(
                     channel_id,
                     f"<blockquote><b>📦 Phase 1/2 — Lectures\nBatch: {cname}</b></blockquote>"
                 )
 
                 lec_status = await m.reply_text("⏳ Fetching all lectures…")
+                # For option 6 we collect ALL subjects/topics without prompting.
+                # We temporarily monkey-patch _bot_pick to always return all items.
                 all_lectures: list = []
                 folder_data = await get_folder_contents(session, api_base, cid, -1, hdr)
                 if folder_data:
@@ -2135,6 +2022,7 @@ async def appx_main_flow(bot_client: Client, m: Message, user_id_tg: int):
                     f"✓ Success: {lec_success}  ✗ Failed: {lec_failed}</blockquote>"
                 )
 
+                # ── Phase 2: all test series ───────────────────────────────
                 if cancel_requested.get(user_id_tg, False):
                     await m.reply_text("🚦 Stopped before Phase 2 (Test Series).")
                 else:
@@ -2147,7 +2035,7 @@ async def appx_main_flow(bot_client: Client, m: Message, user_id_tg: int):
                         bot_client, m, session, api_base,
                         appx_user_id, cid, hdr, course_dir,
                         channel_id=channel_id, cname=cname,
-                        auto_all=True
+                        auto_all=True   # ← skip all pick prompts
                     )
 
                 await bot_client.send_message(
@@ -2183,6 +2071,7 @@ async def appx_main_flow(bot_client: Client, m: Message, user_id_tg: int):
                 except asyncio.TimeoutError:
                     await q_ask.delete()
 
+            # Collect lectures (with subject/topic prompts)
             lec_status = await m.reply_text("⏳ Fetching content…")
             lectures = await collect_all_lectures(
                 bot_client, m, session, api_base, cid, hdr)
