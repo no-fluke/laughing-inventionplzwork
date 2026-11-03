@@ -438,6 +438,19 @@ _CDN_MIGRATIONS = {
 }
 
 
+def _norm_q(q) -> str:
+    """Normalise API quality labels to the 'Np' form we compare against.
+
+    The AppX / ClassX API sometimes returns quality as a bare integer
+    (720, 480 …) and sometimes already with the 'p' suffix (720p, 480p).
+    All internal comparisons use the 'Np' form, so we normalise here.
+    """
+    s = str(q).strip()
+    if s.isdigit():
+        return s + "p"
+    return s
+
+
 def _migrate_cdn(url: str) -> str:
     if not url:
         return url
@@ -508,7 +521,7 @@ def _best_download_link(d: dict, prefer_quality: str = "720p") -> str:
     quality_order = [prefer_quality, "1080p", "720p", "480p", "360p", "240p"]
     by_quality: dict = {}
     for lnk in links:
-        q   = str(lnk.get("bitrate") or lnk.get("quality") or "")
+        q   = _norm_q(lnk.get("bitrate") or lnk.get("quality") or "")
         dec = decrypt_url(lnk.get("path", ""))
         if dec:
             by_quality[q] = dec
@@ -529,7 +542,7 @@ def decrypt_all_links(d: dict) -> list:
             results.append((quality or "?", url))
 
     for link in d.get("encrypted_links", []):
-        q = str(link.get("quality") or "?")
+        q = _norm_q(link.get("quality") or "?")
         for field in ("path", "backup_url", "backup_url2"):
             raw = link.get(field, "")
             if raw:
@@ -545,7 +558,7 @@ def decrypt_all_links(d: dict) -> list:
         except Exception:
             pass
     for lnk in dl_list:
-        q = str(lnk.get("bitrate") or lnk.get("quality") or "?")
+        q = _norm_q(lnk.get("bitrate") or lnk.get("quality") or "?")
         for field in ("path", "backup_url", "backup_url2"):
             raw = lnk.get(field, "")
             if raw:
@@ -674,7 +687,7 @@ async def resolve_video(session, api_base, course_id, video_id, hdr,
     quality_rank = {"1080p": 0, "720p": 1, "480p": 2, "360p": 3, "240p": 4}
     enc_links = sorted(
         d.get("encrypted_links", []),
-        key=lambda x: quality_rank.get(str(x.get("quality", "")), 99)
+        key=lambda x: quality_rank.get(_norm_q(x.get("quality", "")), 99)
     )
     for link in enc_links:
         raw_path = link.get("path", "")
