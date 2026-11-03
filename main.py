@@ -487,12 +487,19 @@ def _is_mp4_url(url: str) -> bool:
 
 def _mp4_headers(url: str) -> dict:
     """
-    Exactly ONE User-Agent and ONE Referer — duplicate keys cause the CDN
-    to reject subsequent byte-range requests with 403.
+    Full headers matching exact HAR capture of working MP4 download.
+    Icy-MetaData + Host + Range are required by Google-Edge-Cache CDN.
     """
+    from urllib.parse import urlparse
+    host = urlparse(url).netloc
     base = {
-        "Referer":    MEDIA_REFERER,
-        "User-Agent": MEDIA_UA,
+        "Referer":         MEDIA_REFERER,
+        "Icy-MetaData":    "1",
+        "Accept-Encoding": "identity",
+        "User-Agent":      MEDIA_UA,
+        "Host":            host,
+        "Connection":      "Keep-Alive",
+        "Range":           "bytes=0-",
     }
     if "appx-content-v2.classx.co.in" in url.lower():
         return {
@@ -1156,9 +1163,13 @@ async def direct_stream_download(url: str, out_path: str):
         async with aiohttp.ClientSession(connector=connector) as dl_sess:
             async with dl_sess.get(
                     url, headers=mp4_hdrs,
-                    timeout=aiohttp.ClientTimeout(total=3600, connect=15, sock_read=90)) as resp:
+                    timeout=aiohttp.ClientTimeout(total=3600, connect=15, sock_read=90),
+                    allow_redirects=True) as resp:
                 if resp.status == 404:
-                    print(f"[Direct] 404 — URL expired")
+                    print(f"[Direct] 404 — URL expired or not found")
+                    return None
+                if resp.status == 403:
+                    print(f"[Direct] 403 — CDN rejected request")
                     return None
                 if resp.status not in (200, 206):
                     return None
