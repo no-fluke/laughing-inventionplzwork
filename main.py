@@ -1,10 +1,11 @@
 """
 ╔══════════════════════════════════════════════════════╗
 ║         AppX / Parmar Academy Downloader             ║
-║           Telegram Bot Edition — v1.1                ║
-║   Merged from Termux v3.8 + Saini Bot Template       ║
-║   Fixes: MESSAGE_ID_INVALID on 2nd item,             ║
-║          mp4 downloads missing Referer/UA headers    ║
+║           Telegram Bot Edition — v1.2                ║
+║   Fixes applied:                                     ║
+║     1. Multi-PDF per lecture (class_pdfs[1:] skip)  ║
+║     2. MP4 URL freshness check + 1MB chunk aiohttp  ║
+║     3. Option 6 — Download EVERYTHING in one shot   ║
 ╚══════════════════════════════════════════════════════╝
 
 COMMANDS:
@@ -103,7 +104,6 @@ PDF_HEADERS = {
     "Connection":      "Keep-Alive",
 }
 
-# Headers required by AppX CDN for EVERY byte-range of mp4/HLS media
 MEDIA_REFERER = "https://player-strict.akamai.net.in/"
 MEDIA_UA      = "Dalvik/2.1.0 (Linux; U; Android 11; RMX2001 Build/RP1A.200720.011)"
 
@@ -129,16 +129,13 @@ BUTTONS_CONTACT = InlineKeyboardMarkup([[
 
 # ══════════════════════════════════════════════════════
 #  SAFE PROGRESS-MESSAGE EDIT
-#  ─ helper.send_vid() deletes the progress message at the
-#    end of each upload, so editing it on the NEXT iteration
-#    raises MESSAGE_ID_INVALID. This wrapper recreates it.
 # ══════════════════════════════════════════════════════
 
 async def safe_progress_edit(bot_client, chat_id, msg, text, **kwargs):
     """
-    Edit a progress message. If it was deleted (e.g. by
-    helper.send_vid after upload), a new one is sent & pinned
-    and returned so the caller can keep using it.
+    Edit a progress message. If it was deleted (e.g. by helper.send_vid
+    after upload), send a new one and return it so the caller can keep
+    using it.
     """
     try:
         await msg.edit_text(text, **kwargs)
@@ -158,7 +155,7 @@ async def safe_progress_edit(bot_client, chat_id, msg, text, **kwargs):
         return new_msg
 
 # ══════════════════════════════════════════════════════
-#  AES / XOR DECRYPTION (from termux script)
+#  AES / XOR DECRYPTION
 # ══════════════════════════════════════════════════════
 
 def decrypt_url(enc_path: str) -> str:
@@ -273,10 +270,7 @@ def _extract_user_id_from_jwt(token: str) -> str:
 
 
 async def appx_login(bot_client: Client, m: Message, api_base: str):
-    """
-    Interactive AppX login via Telegram bot conversation.
-    Returns (token, user_id, user_name) or (None, None, None).
-    """
+    """Interactive AppX login. Returns (token, user_id, user_name)."""
     ask = await m.reply_text(
         "**🔐 AppX Login**\n\n"
         "Choose login method:\n"
@@ -284,7 +278,6 @@ async def appx_login(bot_client: Client, m: Message, api_base: str):
         "**2** — JWT Token\n\n"
         "Reply with `1` or `2`"
     )
-
     try:
         choice_msg: Message = await bot_client.listen(m.chat.id, timeout=60)
         choice = choice_msg.text.strip() if choice_msg.text else ""
@@ -309,7 +302,8 @@ async def appx_login(bot_client: Client, m: Message, api_base: str):
             return None, None, None
         user_id = _extract_user_id_from_jwt(token)
         if not user_id:
-            uid_ask = await m.reply_text("⚠️ Could not extract User ID from token.\n**Send your User ID manually:**")
+            uid_ask = await m.reply_text(
+                "⚠️ Could not extract User ID from token.\n**Send your User ID manually:**")
             try:
                 uid_msg: Message = await bot_client.listen(m.chat.id, timeout=60)
                 user_id = uid_msg.text.strip() if uid_msg.text else ""
@@ -480,9 +474,8 @@ def _is_mp4_url(url: str) -> bool:
 
 def _mp4_headers(url: str) -> dict:
     """
-    Headers for a direct mp4 fetch — only ONE User-Agent key
-    (lowercase from APPX_HEADERS was colliding with the uppercase one,
-    causing the server to reject subsequent ranges).
+    Exactly ONE User-Agent and ONE Referer — duplicate keys cause the CDN
+    to reject subsequent byte-range requests with 403.
     """
     base = {
         "Referer":    MEDIA_REFERER,
@@ -495,7 +488,7 @@ def _mp4_headers(url: str) -> dict:
             "language":             "en",
             "device-type":          "ANDROID",
             "x-tenant-app-version": "420",
-            **base,   # exactly one User-Agent, one Referer
+            **base,
         }
     return base
 
@@ -594,9 +587,14 @@ def _resolve_pdf_url(pdf_link: str, pdf_key: str) -> str:
 
 
 def _extract_class_pdfs(d: dict) -> list:
+    """
+    Returns list of (suffix, url) for ALL PDFs on a lecture item.
+    Both pdf_link and pdf_link2 are extracted.
+    e.g. [("", url1), ("_2", url2)]
+    """
     pdfs = []
-    p1 = _resolve_pdf_url(d.get("pdf_link",  ""), d.get("pdf_encryption_key",  ""))
-    p2 = _resolve_pdf_url(d.get("pdf_link2", ""), d.get("pdf2_encryption_key", ""))
+    p1  = _resolve_pdf_url(d.get("pdf_link",  ""), d.get("pdf_encryption_key",  ""))
+    p2  = _resolve_pdf_url(d.get("pdf_link2", ""), d.get("pdf2_encryption_key", ""))
     if p1:
         pdfs.append(("", p1))
     if p2:
@@ -642,7 +640,6 @@ async def resolve_video(session, api_base, course_id, video_id, hdr,
     class_pdfs    = _extract_class_pdfs(d)
     all_candidates = decrypt_all_links(d)
 
-    # 1. YouTube encrypted video_id
     yt_enc = d.get("video_id", "")
     if yt_enc:
         yt_id = decrypt_url(yt_enc)
@@ -650,12 +647,10 @@ async def resolve_video(session, api_base, course_id, video_id, hdr,
             return (title, f"https://youtu.be/{yt_id}",
                     None, "youtube", class_pdfs, all_candidates)
 
-    # 2. YouTube embed_url
     if str(d.get("ytFlag", "")) == "1" and d.get("embed_url"):
         return (title, d["embed_url"],
                 None, "youtube", class_pdfs, all_candidates)
 
-    # 3. Quality-ranked non-DRM video
     prefer_order = [prefer_quality, "1080p", "720p", "480p", "360p", "240p",
                     "144p", "file_link", "download_link"]
     by_quality: dict = {}
@@ -676,7 +671,6 @@ async def resolve_video(session, api_base, course_id, video_id, hdr,
         vtype = "mp4" if _is_mp4_url(chosen_url) else "hls"
         return title, chosen_url, None, vtype, class_pdfs, all_candidates
 
-    # 4. XOR-encrypted MKV path
     quality_rank = {"1080p": 0, "720p": 1, "480p": 2, "360p": 3, "240p": 4}
     enc_links = sorted(
         d.get("encrypted_links", []),
@@ -694,7 +688,6 @@ async def resolve_video(session, api_base, course_id, video_id, hdr,
         vtype   = "mp4" if _is_mp4_url(video_url) else "hls"
         return title, video_url, xor_key or None, vtype, class_pdfs, all_candidates
 
-    # 5. PDF-only item
     if class_pdfs:
         primary_pdf = class_pdfs[0][1]
         extra_pdfs  = class_pdfs[1:]
@@ -884,7 +877,7 @@ _FFMPEG = _find_tool("ffmpeg")
 _ARIA2C = _find_tool("aria2c")
 
 # ══════════════════════════════════════════════════════
-#  FILENAME / DIRECTORY HELPERS
+#  FILENAME HELPERS
 # ══════════════════════════════════════════════════════
 
 def safe_filename(name: str, idx: int = None) -> str:
@@ -894,6 +887,38 @@ def safe_filename(name: str, idx: int = None) -> str:
     name = name.strip(". ")
     prefix = f"{str(idx).zfill(4)}_" if idx is not None else ""
     return prefix + name
+
+# ══════════════════════════════════════════════════════
+#  FIX 2 — MP4 URL FRESHNESS CHECK
+# ══════════════════════════════════════════════════════
+
+async def _check_url_fresh(url: str, headers: dict, timeout: int = 8) -> bool:
+    """
+    HEAD request to verify a signed CDN URL is still alive before
+    committing a slow downloader. Returns False immediately on 403/404
+    so we don't waste time on all 5 download methods for a dead URL.
+    """
+    try:
+        connector = aiohttp.TCPConnector(ssl=False)
+        async with aiohttp.ClientSession(connector=connector) as s:
+            async with s.head(
+                url, headers=headers, allow_redirects=True,
+                timeout=aiohttp.ClientTimeout(total=timeout)
+            ) as resp:
+                if resp.status in (200, 206):
+                    return True
+                if resp.status == 405:
+                    # HEAD not supported — zero-byte GET
+                    async with s.get(
+                        url, headers=headers, allow_redirects=True,
+                        timeout=aiohttp.ClientTimeout(total=timeout)
+                    ) as gr:
+                        return gr.status in (200, 206)
+                print(f"[URL-check] HTTP {resp.status} — URL may be expired")
+                return False
+    except Exception as e:
+        print(f"[URL-check] {e}")
+        return False
 
 # ══════════════════════════════════════════════════════
 #  HLS FRAGMENT DOWNLOADER
@@ -927,14 +952,12 @@ async def hls_fragment_download(url: str, out_path: str):
     try:
         connector = aiohttp.TCPConnector(ssl=False)
         async with aiohttp.ClientSession(connector=connector) as session:
-            # Fetch manifest
             manifest_data = await fetch_bytes(session, url)
             if not manifest_data:
                 return None
             manifest_text = manifest_data.decode("utf-8", errors="ignore")
             base_url = url.rsplit("/", 1)[0] + "/"
 
-            # Resolve AES-128 key
             aes_key = None
             key_match = re.search(r'#EXT-X-KEY:.*?URI="([^"]+)"', manifest_text)
             if key_match:
@@ -946,7 +969,6 @@ async def hls_fragment_download(url: str, out_path: str):
             iv_match = re.search(r'#EXT-X-KEY:.*?IV=0x([0-9a-fA-F]+)', manifest_text)
             aes_iv = bytes.fromhex(iv_match.group(1).zfill(32)) if iv_match else b'\x00' * 16
 
-            # Collect segments
             segments = []
             for line in manifest_text.splitlines():
                 line = line.strip()
@@ -956,13 +978,11 @@ async def hls_fragment_download(url: str, out_path: str):
             if not segments:
                 return None
 
-            # Download and reassemble
             combined = os.path.join(tmp_dir, "combined.ts")
             with open(combined, "wb") as out_ts:
                 for seg_url in segments:
                     seg_data = await fetch_bytes(session, seg_url)
                     if seg_data is None:
-                        # Re-fetch manifest for fresh signed URLs
                         manifest_data = await fetch_bytes(session, url)
                         if manifest_data:
                             manifest_text = manifest_data.decode("utf-8", errors="ignore")
@@ -977,7 +997,6 @@ async def hls_fragment_download(url: str, out_path: str):
                         seg_data = cipher.decrypt(seg_data)
                     out_ts.write(seg_data)
 
-            # Convert TS → MP4
             if os.path.exists(combined) and os.path.getsize(combined) > 1024:
                 proc = await asyncio.create_subprocess_exec(
                     "ffmpeg", "-y", "-i", combined,
@@ -1075,7 +1094,6 @@ async def download_pdf(url: str, out_path: str):
                         return out
     except Exception as e:
         print(f"[PDF] aiohttp failed: {e}")
-    # Fallback: yt-dlp
     if _YTDLP:
         rc = subprocess.run(
             [_YTDLP, "-o", out, "-R", "5", "--fragment-retries", "10", url],
@@ -1087,41 +1105,66 @@ async def download_pdf(url: str, out_path: str):
 
 
 async def direct_stream_download(url: str, out_path: str):
+    """
+    FIX 2: aiohttp with 1 MB chunks (up from 64 KB) and a truncation
+    check. Detects expired URLs via 404 mid-stream and returns None
+    immediately rather than saving a corrupt partial file.
+    """
     mp4_hdrs = _mp4_headers(url)
     out      = f"{out_path}.mp4"
 
-    # Method 1: aiohttp streaming
     try:
-        connector = aiohttp.TCPConnector(ssl=False, limit=4, keepalive_timeout=30)
+        connector = aiohttp.TCPConnector(ssl=False, limit=4, keepalive_timeout=60)
         async with aiohttp.ClientSession(connector=connector) as dl_sess:
             async with dl_sess.get(
                     url, headers=mp4_hdrs,
-                    timeout=aiohttp.ClientTimeout(total=3600, connect=15, sock_read=60)) as resp:
+                    timeout=aiohttp.ClientTimeout(total=3600, connect=15, sock_read=90)) as resp:
+                if resp.status == 404:
+                    print(f"[Direct] 404 — URL expired")
+                    return None
                 if resp.status not in (200, 206):
                     return None
-                expected = int(resp.headers.get("Content-Length") or 0)
-                written  = 0
+                expected   = int(resp.headers.get("Content-Length") or 0)
+                downloaded = 0
+                last_log   = time.time()
+                start_t    = time.time()
+
                 async with aiofiles.open(out, "wb") as f:
-                    async for chunk in resp.content.iter_chunked(65536):
+                    # 1 MB chunks — fills TCP window properly on fast CDN
+                    async for chunk in resp.content.iter_chunked(1048576):
                         await f.write(chunk)
-                        written += len(chunk)
-                if expected and written < expected:
-                    print(f"[Direct] Truncated: {written}/{expected} bytes — discarding")
-                    try:
-                        os.remove(out)
-                    except Exception:
-                        pass
+                        downloaded += len(chunk)
+                        now = time.time()
+                        if now - last_log >= 5:
+                            speed = downloaded / (now - start_t) / (1024 * 1024)
+                            if expected:
+                                pct = downloaded / expected * 100
+                                print(f"[Direct] {downloaded/(1024*1024):.1f}/"
+                                      f"{expected/(1024*1024):.1f} MB "
+                                      f"({pct:.0f}%) @ {speed:.1f} MB/s", end="\r")
+                            else:
+                                print(f"[Direct] {downloaded/(1024*1024):.1f} MB "
+                                      f"@ {speed:.1f} MB/s", end="\r")
+                            last_log = now
+                print()
+
+                # Truncation check — discard if we got less than 98% of expected
+                actual = os.path.getsize(out) if os.path.exists(out) else 0
+                if expected and actual < expected * 0.98:
+                    print(f"[Direct] Truncated ({actual/(1024*1024):.1f} MB "
+                          f"of {expected/(1024*1024):.1f} MB) — discarding")
+                    try: os.remove(out)
+                    except Exception: pass
                     return None
+
         if os.path.exists(out) and os.path.getsize(out) > 1024:
             return out
     except Exception as e:
         print(f"[Direct] aiohttp failed: {e}")
-        try:
-            os.remove(out)
-        except Exception:
-            pass
+        try: os.remove(out)
+        except Exception: pass
 
-    # Method 2: yt-dlp WITH headers (the path that actually works)
+    # yt-dlp fallback WITH correct headers
     if _YTDLP:
         res = await ytdlp_download(url, out_path, extra_headers=mp4_hdrs)
         if res:
@@ -1141,10 +1184,26 @@ async def _download_single_url(url: str, vtype: str, xor_key: str,
     }
 
     if _is_mp4_url(url) or url.lower().split("?")[0].endswith(".mp4"):
-        # yt-dlp with headers is the primary path — it handles ranges correctly
-        result = await ytdlp_download(url, out_path, extra_headers=_mp4_headers(url))
-        if not result:
-            result = await direct_stream_download(url, out_path)
+        mp4_hdrs = _mp4_headers(url)
+
+        # FIX 2: Check URL is alive before trying any downloader
+        print(f"[MP4] Checking URL freshness…")
+        if not await _check_url_fresh(url, mp4_hdrs):
+            print(f"[MP4] URL is dead (403/404) — skipping")
+            return None
+
+        # Method 1: aiohttp with 1 MB chunks (fastest start, no subprocess)
+        result = await direct_stream_download(url, out_path)
+        if result:
+            return result
+
+        # Method 2: yt-dlp with correct headers
+        result = await ytdlp_download(url, out_path, extra_headers=mp4_hdrs)
+        if result:
+            return result
+
+        return None
+
     elif ".m3u8" in url.lower():
         result = await ytdlp_download(url, out_path, extra_headers=media_headers)
         if not result:
@@ -1212,11 +1271,17 @@ async def download_item(title: str, url: str, xor_key: str, vtype: str,
         size = os.path.getsize(result) / (1024 * 1024)
         print(f"[Download] ✓ Saved: {os.path.basename(result)} ({size:.1f} MB)")
 
+    # FIX 1 — download ALL class PDFs, not just the first one
     if want_pdf and class_pdfs:
         for suffix, pdf_url in class_pdfs:
             if not pdf_url:
                 continue
-            await download_pdf(pdf_url, f"{out_path}{suffix}")
+            pdf_result = await download_pdf(pdf_url, f"{out_path}{suffix}")
+            if pdf_result and os.path.exists(pdf_result):
+                sz = os.path.getsize(pdf_result) / (1024 * 1024)
+                print(f"[Download] ✓ PDF{suffix}: {os.path.basename(pdf_result)} ({sz:.1f} MB)")
+            else:
+                print(f"[Download] ✗ PDF{suffix} failed")
 
     return bool(result and os.path.exists(result))
 
@@ -1227,10 +1292,6 @@ async def download_item(title: str, url: str, xor_key: str, vtype: str,
 async def _bot_pick(bot_client: Client, m: Message,
                     items: list, label_fn, title: str,
                     allow_range: bool = True) -> list:
-    """
-    Send a numbered list, user replies with numbers/ranges/all.
-    Returns selected items.
-    """
     if not items:
         return []
     lines = [f"**{title}**\n"]
@@ -1240,7 +1301,6 @@ async def _bot_pick(bot_client: Client, m: Message,
         "\n_Send number(s), range (e.g. `2-5`), comma list, or `all`_"
     )
     text = "\n".join(lines)
-    # Split if too long
     if len(text) > 4000:
         chunk_size = 50
         for idx in range(0, len(items), chunk_size):
@@ -1347,13 +1407,21 @@ async def collect_all_lectures(bot_client: Client, m: Message,
 
 async def download_test_series(bot_client: Client, m: Message,
                                session, api_base, user_id, cid, hdr,
-                               course_dir: str):
+                               course_dir: str,
+                               channel_id: int = None,
+                               cname: str = "",
+                               auto_all: bool = False):
+    """
+    Download test series.  auto_all=True skips the pick prompts and
+    downloads every series / subject / test automatically (used by
+    the Download Everything flow — option 6).
+    """
+    channel_id = channel_id or m.chat.id
     status = await m.reply_text("⏳ Fetching test series list…")
     series_list = await get_test_series_list(session, api_base, user_id, cid, hdr)
     if not series_list:
         await status.edit_text("❌ No test series found inside this batch.")
         return
-
     await status.delete()
 
     def _series_label(s):
@@ -1369,9 +1437,12 @@ async def download_test_series(bot_client: Client, m: Message,
         suffix = f" [{', '.join(parts)}]" if parts else ""
         return f"{name}{suffix}"
 
-    chosen_series = await _bot_pick(
-        bot_client, m, series_list, _series_label, "🧪 Select Test Series"
-    )
+    if auto_all:
+        chosen_series = series_list
+    else:
+        chosen_series = await _bot_pick(
+            bot_client, m, series_list, _series_label, "🧪 Select Test Series"
+        )
     if not chosen_series:
         return
 
@@ -1383,11 +1454,14 @@ async def download_test_series(bot_client: Client, m: Message,
         if not subjects:
             subjects = [{"subjectid": 0, "subject_name": "All Tests", "id": 0}]
 
-        chosen_subjects = await _bot_pick(
-            bot_client, m, subjects,
-            lambda s: s.get("subject_name") or s.get("name") or "?",
-            f"📌 Subjects in '{sname}'"
-        )
+        if auto_all:
+            chosen_subjects = subjects
+        else:
+            chosen_subjects = await _bot_pick(
+                bot_client, m, subjects,
+                lambda s: s.get("subject_name") or s.get("name") or "?",
+                f"📌 Subjects in '{sname}'"
+            )
         if not chosen_subjects:
             continue
 
@@ -1417,10 +1491,13 @@ async def download_test_series(bot_client: Client, m: Message,
             if mins:  parts.append(f"{mins} min")
             return f"{name}{' [' + ', '.join(parts) + ']' if parts else ''}"
 
-        chosen_tests = await _bot_pick(
-            bot_client, m, all_tests, _test_label,
-            f"📝 Tests in '{sname}'"
-        )
+        if auto_all:
+            chosen_tests = all_tests
+        else:
+            chosen_tests = await _bot_pick(
+                bot_client, m, all_tests, _test_label,
+                f"📝 Tests in '{sname}'"
+            )
         if not chosen_tests:
             continue
 
@@ -1429,7 +1506,10 @@ async def download_test_series(bot_client: Client, m: Message,
 
         success = failed = 0
         total   = len(chosen_tests)
-        prog    = await m.reply_text(f"⏳ Downloading {total} tests…")
+        prog    = await bot_client.send_message(
+            channel_id,
+            f"⏳ Downloading {total} tests from **{sname}**…"
+        )
 
         for i, test in enumerate(chosen_tests, 1):
             tname = test.get("title") or test.get("name") or f"Test_{test.get('id','?')}"
@@ -1441,7 +1521,7 @@ async def download_test_series(bot_client: Client, m: Message,
             out_path = os.path.join(out_dir, safe_filename(tname, i))
 
             prog = await safe_progress_edit(
-                bot_client, m.chat.id, prog,
+                bot_client, channel_id, prog,
                 f"🧪 **Test {i}/{total}**\n"
                 f"`{tname[:60]}`\n"
                 f"📁 Subject: {subj}"
@@ -1455,7 +1535,8 @@ async def download_test_series(bot_client: Client, m: Message,
 
             qfile = save_quiz_txt(questions, out_path, tname)
             if qfile:
-                await m.reply_document(
+                await bot_client.send_document(
+                    channel_id,
                     document=qfile,
                     caption=f"📝 `{os.path.basename(qfile)}`\n`{len(questions)} questions`"
                 )
@@ -1465,22 +1546,268 @@ async def download_test_series(bot_client: Client, m: Message,
                 failed += 1
             await asyncio.sleep(0.5)
 
-        prog = await safe_progress_edit(
-            bot_client, m.chat.id, prog,
+        await safe_progress_edit(
+            bot_client, channel_id, prog,
             f"✅ **Test Series Complete: {sname}**\n"
             f"✓ Saved: {success}  ✗ Failed: {failed}"
         )
+
+# ══════════════════════════════════════════════════════
+#  LECTURE DOWNLOAD LOOP  (shared by options 1-4 and 6)
+# ══════════════════════════════════════════════════════
+
+async def run_lecture_loop(
+    bot_client: Client,
+    m: Message,
+    session,
+    api_base: str,
+    cid: str,
+    cname: str,
+    hdr: dict,
+    appx_user_id: str,
+    channel_id: int,
+    want_video: bool,
+    want_pdf: bool,
+    want_quiz: bool,
+    prefer_quality: str,
+    batch_watermark,
+    lectures: list,
+    start_idx: int,
+    downloads_dir: str,
+):
+    """
+    The inner loop that downloads lectures.  Extracted so both the
+    single-mode flow and the Download-Everything flow can share it.
+    Returns (success, failed) counts.
+    """
+    success = failed = 0
+    total   = len(lectures)
+
+    prog_msg = await bot_client.send_message(
+        channel_id,
+        f"<blockquote><b>🎯 Batch: {cname}</b></blockquote>"
+    )
+    try:
+        await bot_client.pin_chat_message(channel_id, prog_msg.id)
+    except Exception:
+        pass
+
+    for i, lec in enumerate(lectures, start=start_idx + 1):
+        if cancel_requested.get(m.from_user.id, False):
+            await m.reply_text("🚦 **STOPPED**")
+            break
+
+        title   = lec.get("Title") or f"Lecture_{lec.get('id','?')}"
+        lec_id  = lec.get("id")
+        mat     = lec.get("material_type", "")
+        subject = lec.get("_subject", "")
+        topic   = lec.get("_topic", "")
+
+        prog_msg = await safe_progress_edit(
+            bot_client, channel_id, prog_msg,
+            f"<blockquote>"
+            f"🚀 Progress: {i}/{total} ({i*100//total}%)\n"
+            f"📚 Title: {title[:50]}\n"
+            f"📁 {subject} → {topic}\n"
+            f"💃 Batch: {cname}"
+            f"</blockquote>\n"
+            f"🛑 /stop to cancel"
+        )
+
+        name     = safe_filename(title, i)
+        out_path = os.path.join(downloads_dir, name)
+
+        # ── Quiz detection ──────────────────────────────────────────
+        QUIZ_TYPES = {"QUIZ", "TEST", "ATTEMPT", "EXERCISE", "ASSIGNMENT"}
+        _raw_qid   = str(lec.get("quiz_title_id") or lec.get("quiz_id") or "")
+        _has_quiz  = (
+            mat.upper() in QUIZ_TYPES
+            or "quiz" in mat.lower()
+            or (_raw_qid not in ("", "0", "-1", "None"))
+        )
+        if _has_quiz:
+            quiz_id = _raw_qid or str(lec_id) or ""
+            if want_quiz and quiz_id:
+                questions = await fetch_quiz(session, api_base, quiz_id, appx_user_id, hdr)
+                if questions:
+                    qfile = save_quiz_txt(questions, out_path, title)
+                    if qfile:
+                        await bot_client.send_document(
+                            channel_id,
+                            document=qfile,
+                            caption=(
+                                f"📝 `{title[:60]}`\n"
+                                f"`{len(questions)} questions`\n"
+                                f"`{i}/{total}` | Batch: {cname}"
+                            )
+                        )
+                        os.remove(qfile)
+                        success += 1
+                    else:
+                        failed += 1
+                else:
+                    failed += 1
+
+            if mat.upper() in QUIZ_TYPES or (
+                    "quiz" in mat.lower() and mat.upper() != "VIDEO"):
+                continue
+
+        # ── Resolve URL ─────────────────────────────────────────────
+        vtitle, url, xor_key, vtype, class_pdfs, all_candidates = \
+            await resolve_video(
+                session, api_base, cid, lec_id, hdr,
+                prefer_quality=prefer_quality)
+
+        if not url and not class_pdfs and not all_candidates:
+            failed += 1
+            continue
+
+        cc  = (
+            f"[🎥] `{str(i).zfill(3)}) {title[:60]} [{prefer_quality}]`\n"
+            f"<blockquote>Batch: {cname}</blockquote>\n"
+            f"Extracted by ➤ {CREDIT}"
+        )
+        cc1 = (
+            f"[📕] `{str(i).zfill(3)}) {title[:60]}.pdf`\n"
+            f"<blockquote>Batch: {cname}</blockquote>\n"
+            f"Extracted by ➤ {CREDIT}"
+        )
+
+        # ── FIX 1: handle PDF-type items with ALL attached PDFs ─────
+        if vtype == "pdf" and want_pdf:
+            # url is class_pdfs[0] when vtype=="pdf" — download it directly
+            pr = await download_pdf(url, out_path)
+            if pr:
+                await bot_client.send_document(channel_id, document=pr, caption=cc1)
+                os.remove(pr)
+                success += 1
+            else:
+                failed += 1
+
+            # Extra PDFs (class_pdfs[1:]) — primary was already the first entry
+            # so we skip index 0 to avoid re-downloading it.
+            for idx2, (suffix, purl) in enumerate(class_pdfs, start=2):
+                if not purl:
+                    continue
+                pr2 = await download_pdf(purl, f"{out_path}_extra_{idx2}")
+                if pr2:
+                    cc_extra = (
+                        f"[📕] `{str(i).zfill(3)}) {title[:55]}_p{idx2}.pdf`\n"
+                        f"<blockquote>Batch: {cname}</blockquote>\n"
+                        f"Extracted by ➤ {CREDIT}"
+                    )
+                    await bot_client.send_document(channel_id, document=pr2, caption=cc_extra)
+                    os.remove(pr2)
+            continue
+
+        if vtype == "pdf" and not want_pdf:
+            continue
+
+        if vtype not in ("pdf",) and not want_video:
+            # Still send class PDFs even when skipping video
+            if want_pdf and class_pdfs:
+                for suffix, purl in class_pdfs:
+                    if not purl:
+                        continue
+                    pr = await download_pdf(purl, f"{out_path}{suffix}")
+                    if pr:
+                        await bot_client.send_document(channel_id, document=pr, caption=cc1)
+                        os.remove(pr)
+            continue
+
+        # ── YouTube ─────────────────────────────────────────────────
+        if vtype == "youtube":
+            ytf = f"bv*[height<={prefer_quality[:-1]}][ext=mp4]+ba[ext=m4a]/b[height<=?{prefer_quality[:-1]}]"
+            cmd = (
+                f'yt-dlp --cookies {cookies_file_path} '
+                f'--extractor-args "youtube:player_client=android" '
+                f'-f "{ytf}" -R 25 --fragment-retries 25 '
+                f'"{url}" -o "{out_path}.mp4"'
+            )
+            await bot_client.send_message(channel_id,
+                f"⬇️ YouTube: `{title[:60]}`\n`{i}/{total}`")
+            filename = await helper.download_video(url, cmd, out_path)
+            if filename:
+                await helper.send_vid(
+                    bot_client, m, cc, filename, "/d", name,
+                    prog_msg, channel_id, watermark_text=batch_watermark)
+                success += 1
+            else:
+                failed += 1
+            await asyncio.sleep(1)
+            continue
+
+        # ── Regular video (HLS / MP4 / encrypted) ───────────────────
+        if 'encrypted.m' in (url or ""):
+            appxkey  = url.split('*')[1]
+            url      = url.split('*')[0]
+            res_file = await helper.download_and_decrypt_video(url, "", out_path, appxkey)
+        else:
+            q_num = prefer_quality.replace("p", "")
+            ytf   = f"b[height<={q_num}]/bv[height<={q_num}]+ba/b/bv+ba"
+            header_args = (
+                f'--add-header "Referer: {MEDIA_REFERER}" '
+                f'--add-header "User-Agent: {MEDIA_UA}" '
+            )
+            if _is_mp4_url(url) or url.lower().split("?")[0].endswith(".mp4"):
+                cmd = (
+                    f'yt-dlp {header_args} '
+                    f'-f "{ytf}" -R 25 --fragment-retries 25 '
+                    f'"{url}" -o "{out_path}.mp4"'
+                )
+            else:
+                cmd = (
+                    f'yt-dlp {header_args} '
+                    f'-f "{ytf}" --concurrent-fragments 16 --no-part '
+                    f'-R 25 --fragment-retries 25 '
+                    f'"{url}" -o "{out_path}.mp4"'
+                )
+            res_file = await helper.download_video(url, cmd, out_path)
+
+        if res_file:
+            await helper.send_vid(
+                bot_client, m, cc, res_file, "/d", name,
+                prog_msg, channel_id, watermark_text=batch_watermark)
+            # FIX 1: also send class PDFs attached to this video lecture
+            if want_pdf and class_pdfs:
+                for suffix, purl in class_pdfs:
+                    if not purl:
+                        continue
+                    pr = await download_pdf(purl, f"{out_path}{suffix}")
+                    if pr:
+                        await bot_client.send_document(channel_id, document=pr, caption=cc1)
+                        os.remove(pr)
+            success += 1
+        else:
+            ok = await download_item(
+                vtitle or title, url, xor_key, vtype, out_path,
+                hdr=hdr, class_pdfs=class_pdfs, want_pdf=want_pdf,
+                all_candidates=all_candidates)
+            if ok:
+                for ext in ["mp4", "mkv", "webm", "ts"]:
+                    fpath = f"{out_path}.{ext}"
+                    if os.path.exists(fpath):
+                        await helper.send_vid(
+                            bot_client, m, cc, fpath, "/d", name,
+                            prog_msg, channel_id, watermark_text=batch_watermark)
+                        break
+                success += 1
+            else:
+                await bot_client.send_message(
+                    channel_id,
+                    f"⚠️ **Failed:** `{str(i).zfill(3)}) {title[:60]}`"
+                )
+                failed += 1
+
+        await asyncio.sleep(1)
+
+    return success, failed
 
 # ══════════════════════════════════════════════════════
 #  MAIN APPX DOWNLOAD FLOW
 # ══════════════════════════════════════════════════════
 
 async def appx_main_flow(bot_client: Client, m: Message, user_id_tg: int):
-    """
-    Full interactive AppX downloader flow, adapted from termux main().
-    All input() calls replaced with bot_client.listen().
-    Files are sent to Telegram instead of saved to local disk.
-    """
     # ── Step 1: API Domain ────────────────────────────────────────────────
     domain_ask = await m.reply_text(
         "**🌐 Enter API Domain**\n\n"
@@ -1547,7 +1874,8 @@ async def appx_main_flow(bot_client: Client, m: Message, user_id_tg: int):
                 "`2` — PDFs only\n"
                 "`3` — Everything (videos + PDFs + quizzes)\n"
                 "`4` — Quizzes only\n"
-                "`5` — Test Series\n\n"
+                "`5` — Test Series\n"
+                "`6` — 🔥 Download EVERYTHING (videos + PDFs + quizzes + ALL test series)\n\n"
                 "_Send a number (20s timeout → default 3):_"
             )
             try:
@@ -1559,16 +1887,169 @@ async def appx_main_flow(bot_client: Client, m: Message, user_id_tg: int):
                 dl_choice = "3"
                 await dl_type_ask.delete()
 
-            # ── Test Series ────────────────────────────────────────────────
+            # ── Common: upload destination & watermark (shared by all modes) ─
+            chan_ask = await m.reply_text(
+                "**Upload to channel/group?**\n"
+                "Send Channel ID (e.g. `-100xxxxxxxxxx`) or `/d` to upload here.\n"
+                "_20s timeout → upload here:_"
+            )
+            try:
+                chan_msg: Message = await bot_client.listen(m.chat.id, timeout=20)
+                raw_chan = chan_msg.text.strip() if chan_msg.text else "/d"
+                await chan_msg.delete()
+                await chan_ask.delete()
+            except asyncio.TimeoutError:
+                raw_chan = "/d"
+                await chan_ask.delete()
+
+            channel_id = (m.chat.id if "/d" in raw_chan
+                          else (int(raw_chan) if raw_chan.lstrip("-").isdigit() else m.chat.id))
+
+            wm_ask = await m.reply_text(
+                "**🖊️ Add watermark text?**\n"
+                "Send text (e.g. `@YourChannel`) or `/d` to skip.\n_20s timeout:_"
+            )
+            try:
+                wm_msg: Message = await bot_client.listen(m.chat.id, timeout=20)
+                raw_wm = wm_msg.text.strip() if wm_msg.text else "/d"
+                await wm_msg.delete()
+                await wm_ask.delete()
+            except asyncio.TimeoutError:
+                raw_wm = "/d"
+                await wm_ask.delete()
+            batch_watermark = None if raw_wm == "/d" else raw_wm
+
+            downloads_dir = os.path.join(tempfile.gettempdir(), "downloads")
+            os.makedirs(downloads_dir, exist_ok=True)
+
+            # ══════════════════════════════════════════════════════
+            #  OPTION 5 — Test Series only
+            # ══════════════════════════════════════════════════════
             if dl_choice == "5":
                 course_dir = os.path.join(tempfile.gettempdir(), "downloads")
                 os.makedirs(course_dir, exist_ok=True)
                 await download_test_series(
                     bot_client, m, session, api_base,
-                    appx_user_id, cid, hdr, course_dir)
+                    appx_user_id, cid, hdr, course_dir,
+                    channel_id=channel_id, cname=cname)
                 continue
 
-            # ── Quality ────────────────────────────────────────────────────
+            # ══════════════════════════════════════════════════════
+            #  OPTION 6 — Download EVERYTHING automatically
+            # ══════════════════════════════════════════════════════
+            if dl_choice == "6":
+                await m.reply_text(
+                    "🔥 **Download EVERYTHING mode**\n\n"
+                    "Will download in this order:\n"
+                    "1️⃣ All videos + PDFs + lecture quizzes\n"
+                    "2️⃣ All test series (every series, every subject, every test)\n\n"
+                    "No further prompts — starting now…"
+                )
+
+                # Quality for videos
+                q_ask = await m.reply_text(
+                    "**Video quality?**\n"
+                    "`1` 1080p  `2` 720p (default)  `3` 480p\n"
+                    "`4` 360p   `5` 240p\n"
+                    "_Send choice (20s timeout → 720p):_"
+                )
+                try:
+                    q_msg: Message = await bot_client.listen(m.chat.id, timeout=20)
+                    q_map = {"1":"1080p","2":"720p","3":"480p","4":"360p","5":"240p"}
+                    prefer_quality = q_map.get(q_msg.text.strip() if q_msg.text else "2", "720p")
+                    await q_msg.delete()
+                    await q_ask.delete()
+                except asyncio.TimeoutError:
+                    prefer_quality = "720p"
+                    await q_ask.delete()
+
+                # ── Phase 1: all lectures (video + PDF + quiz) ─────────────
+                await bot_client.send_message(
+                    channel_id,
+                    f"<blockquote><b>📦 Phase 1/2 — Lectures\nBatch: {cname}</b></blockquote>"
+                )
+
+                lec_status = await m.reply_text("⏳ Fetching all lectures…")
+                # For option 6 we collect ALL subjects/topics without prompting.
+                # We temporarily monkey-patch _bot_pick to always return all items.
+                all_lectures: list = []
+                folder_data = await get_folder_contents(session, api_base, cid, -1, hdr)
+                if folder_data:
+                    await _collect_folder_recursive(
+                        session, api_base, cid, -1, hdr, all_lectures)
+                else:
+                    subjects = await get_subjects(session, api_base, cid, hdr)
+                    for sub in subjects:
+                        si = sub.get("subjectid")
+                        sn = sub.get("subject_name", "")
+                        topics = await get_topics(session, api_base, cid, si, hdr)
+                        for topic in topics:
+                            ti   = topic.get("topicid")
+                            tn   = topic.get("topic_name", "")
+                            lecs = await get_lectures(session, api_base, cid, si, ti, hdr)
+                            for lec in lecs:
+                                lec["_subject"] = sn
+                                lec["_topic"]   = tn
+                            all_lectures.extend(lecs)
+                            await asyncio.sleep(0.2)
+
+                await lec_status.delete()
+                await m.reply_text(f"✅ Found **{len(all_lectures)}** lectures — starting download…")
+
+                lec_success, lec_failed = await run_lecture_loop(
+                    bot_client=bot_client,
+                    m=m,
+                    session=session,
+                    api_base=api_base,
+                    cid=cid,
+                    cname=cname,
+                    hdr=hdr,
+                    appx_user_id=appx_user_id,
+                    channel_id=channel_id,
+                    want_video=True,
+                    want_pdf=True,
+                    want_quiz=True,
+                    prefer_quality=prefer_quality,
+                    batch_watermark=batch_watermark,
+                    lectures=all_lectures,
+                    start_idx=0,
+                    downloads_dir=downloads_dir,
+                )
+
+                await bot_client.send_message(
+                    channel_id,
+                    f"<blockquote><b>✅ Phase 1 Complete — Lectures</b>\n"
+                    f"✓ Success: {lec_success}  ✗ Failed: {lec_failed}</blockquote>"
+                )
+
+                # ── Phase 2: all test series ───────────────────────────────
+                if cancel_requested.get(user_id_tg, False):
+                    await m.reply_text("🚦 Stopped before Phase 2 (Test Series).")
+                else:
+                    await bot_client.send_message(
+                        channel_id,
+                        f"<blockquote><b>📦 Phase 2/2 — Test Series\nBatch: {cname}</b></blockquote>"
+                    )
+                    course_dir = os.path.join(tempfile.gettempdir(), "downloads")
+                    await download_test_series(
+                        bot_client, m, session, api_base,
+                        appx_user_id, cid, hdr, course_dir,
+                        channel_id=channel_id, cname=cname,
+                        auto_all=True   # ← skip all pick prompts
+                    )
+
+                await bot_client.send_message(
+                    channel_id,
+                    f"<b>-┈━═.•° 🔥 EVERYTHING Downloaded ✅ °•.═━┈-</b>\n"
+                    f"<blockquote><b>🎯 Batch: {cname}</b>\n"
+                    f"📹 Lectures  ✓ {lec_success}  ✗ {lec_failed}\n"
+                    f"🧪 Test Series — see above for individual counts</blockquote>"
+                )
+                continue
+
+            # ══════════════════════════════════════════════════════
+            #  OPTIONS 1-4 — Lecture-based modes
+            # ══════════════════════════════════════════════════════
             want_video = dl_choice in ("1", "3", "")
             want_pdf   = dl_choice in ("2", "3")
             want_quiz  = dl_choice in ("3", "4")
@@ -1590,7 +2071,7 @@ async def appx_main_flow(bot_client: Client, m: Message, user_id_tg: int):
                 except asyncio.TimeoutError:
                     await q_ask.delete()
 
-            # ── Collect lectures ───────────────────────────────────────────
+            # Collect lectures (with subject/topic prompts)
             lec_status = await m.reply_text("⏳ Fetching content…")
             lectures = await collect_all_lectures(
                 bot_client, m, session, api_base, cid, hdr)
@@ -1602,7 +2083,6 @@ async def appx_main_flow(bot_client: Client, m: Message, user_id_tg: int):
 
             await m.reply_text(f"✅ Found **{len(lectures)}** lectures")
 
-            # ── Start index ────────────────────────────────────────────────
             start_ask = await m.reply_text(
                 f"**Start from lecture number?** [1-{len(lectures)}, default 1]\n_20s timeout:_"
             )
@@ -1618,276 +2098,26 @@ async def appx_main_flow(bot_client: Client, m: Message, user_id_tg: int):
             start_idx = (int(start_raw) - 1) if start_raw.isdigit() else 0
             lectures  = lectures[start_idx:]
 
-            # ── Upload destination ─────────────────────────────────────────
-            chan_ask = await m.reply_text(
-                "**Upload to channel/group?**\n"
-                "Send Channel ID (e.g. `-100xxxxxxxxxx`) or `/d` to upload here.\n"
-                "_20s timeout → upload here:_"
+            success, failed = await run_lecture_loop(
+                bot_client=bot_client,
+                m=m,
+                session=session,
+                api_base=api_base,
+                cid=cid,
+                cname=cname,
+                hdr=hdr,
+                appx_user_id=appx_user_id,
+                channel_id=channel_id,
+                want_video=want_video,
+                want_pdf=want_pdf,
+                want_quiz=want_quiz,
+                prefer_quality=prefer_quality,
+                batch_watermark=batch_watermark,
+                lectures=lectures,
+                start_idx=start_idx,
+                downloads_dir=downloads_dir,
             )
-            try:
-                chan_msg: Message = await bot_client.listen(m.chat.id, timeout=20)
-                raw_chan = chan_msg.text.strip() if chan_msg.text else "/d"
-                await chan_msg.delete()
-                await chan_ask.delete()
-            except asyncio.TimeoutError:
-                raw_chan = "/d"
-                await chan_ask.delete()
 
-            if "/d" in raw_chan:
-                channel_id = m.chat.id
-            else:
-                channel_id = int(raw_chan) if raw_chan.lstrip("-").isdigit() else m.chat.id
-
-            # ── Watermark ──────────────────────────────────────────────────
-            wm_ask = await m.reply_text(
-                "**🖊️ Add watermark text?**\n"
-                "Send text (e.g. `@YourChannel`) or `/d` to skip.\n_20s timeout:_"
-            )
-            try:
-                wm_msg: Message = await bot_client.listen(m.chat.id, timeout=20)
-                raw_wm = wm_msg.text.strip() if wm_msg.text else "/d"
-                await wm_msg.delete()
-                await wm_ask.delete()
-            except asyncio.TimeoutError:
-                raw_wm = "/d"
-                await wm_ask.delete()
-            batch_watermark = None if raw_wm == "/d" else raw_wm
-
-            # ── Progress message ───────────────────────────────────────────
-            success = failed = 0
-            total   = len(lectures)
-            prog_msg = await bot_client.send_message(
-                channel_id,
-                f"<blockquote><b>🎯 Batch: {cname}</b></blockquote>"
-            )
-            try:
-                await bot_client.pin_chat_message(channel_id, prog_msg.id)
-            except Exception:
-                pass
-
-            downloads_dir = os.path.join(tempfile.gettempdir(), "downloads")
-            os.makedirs(downloads_dir, exist_ok=True)
-
-            # ── Lecture loop ──────────────────────────────────────────────
-            for i, lec in enumerate(lectures, start=start_idx + 1):
-                if cancel_requested.get(user_id_tg, False):
-                    await m.reply_text("🚦 **STOPPED**")
-                    processing_request[user_id_tg] = False
-                    cancel_requested[user_id_tg] = False
-                    break
-
-                title   = lec.get("Title") or f"Lecture_{lec.get('id','?')}"
-                lec_id  = lec.get("id")
-                mat     = lec.get("material_type", "")
-                subject = lec.get("_subject", "")
-                topic   = lec.get("_topic", "")
-
-                # safe_progress_edit recreates prog_msg if helper.send_vid
-                # deleted it during the previous iteration.
-                prog_msg = await safe_progress_edit(
-                    bot_client, channel_id, prog_msg,
-                    f"<blockquote>"
-                    f"🚀 Progress: {i}/{total} ({i*100//total}%)\n"
-                    f"📚 Title: {title[:50]}\n"
-                    f"📁 {subject} → {topic}\n"
-                    f"💃 Batch: {cname}"
-                    f"</blockquote>\n"
-                    f"🛑 /stop to cancel"
-                )
-
-                name       = safe_filename(title, i)
-                out_path   = os.path.join(downloads_dir, name)
-
-                # ── Quiz detection ────────────────────────────────────────
-                QUIZ_TYPES = {"QUIZ", "TEST", "ATTEMPT", "EXERCISE", "ASSIGNMENT"}
-                _raw_qid   = str(lec.get("quiz_title_id") or lec.get("quiz_id") or "")
-                _has_quiz  = (
-                    mat.upper() in QUIZ_TYPES
-                    or "quiz" in mat.lower()
-                    or (_raw_qid not in ("", "0", "-1", "None"))
-                )
-                if _has_quiz:
-                    quiz_id = _raw_qid or str(lec_id) or ""
-                    if want_quiz and quiz_id:
-                        questions = await fetch_quiz(session, api_base, quiz_id, appx_user_id, hdr)
-                        if questions:
-                            qfile = save_quiz_txt(questions, out_path, title)
-                            if qfile:
-                                await bot_client.send_document(
-                                    channel_id,
-                                    document=qfile,
-                                    caption=(
-                                        f"📝 `{title[:60]}`\n"
-                                        f"`{len(questions)} questions`\n"
-                                        f"`{i}/{total}` | Batch: {cname}"
-                                    )
-                                )
-                                os.remove(qfile)
-                                success += 1
-                            else:
-                                failed += 1
-                        else:
-                            failed += 1
-
-                    if mat.upper() in QUIZ_TYPES or (
-                            "quiz" in mat.lower() and mat.upper() != "VIDEO"):
-                        continue
-
-                # ── Resolve URL ───────────────────────────────────────────
-                vtitle, url, xor_key, vtype, class_pdfs, all_candidates = \
-                    await resolve_video(
-                        session, api_base, cid, lec_id, hdr,
-                        prefer_quality=prefer_quality)
-
-                if not url and not class_pdfs and not all_candidates:
-                    failed += 1
-                    continue
-
-                if vtype == "pdf" and not want_pdf:
-                    if want_pdf and class_pdfs:
-                        for suffix, purl in class_pdfs:
-                            if not purl:
-                                continue
-                            pr = await download_pdf(purl, f"{out_path}{suffix}")
-                            if pr:
-                                await bot_client.send_document(
-                                    channel_id,
-                                    document=pr,
-                                    caption=f"📕 `{title[:60]} .pdf`\n`{i}/{total}` | {cname}"
-                                )
-                                os.remove(pr)
-                    continue
-                if vtype not in ("pdf",) and not want_video:
-                    if want_pdf and class_pdfs:
-                        for suffix, purl in class_pdfs:
-                            if not purl:
-                                continue
-                            pr = await download_pdf(purl, f"{out_path}{suffix}")
-                            if pr:
-                                await bot_client.send_document(
-                                    channel_id,
-                                    document=pr,
-                                    caption=f"📕 `{title[:60]}.pdf`\n`{i}/{total}` | {cname}"
-                                )
-                                os.remove(pr)
-                    continue
-
-                cc  = (
-                    f"[🎥] `{str(i).zfill(3)}) {title[:60]} [{prefer_quality}]`\n"
-                    f"<blockquote>Batch: {cname}</blockquote>\n"
-                    f"Extracted by ➤ {CREDIT}"
-                )
-                cc1 = (
-                    f"[📕] `{str(i).zfill(3)}) {title[:60]}.pdf`\n"
-                    f"<blockquote>Batch: {cname}</blockquote>\n"
-                    f"Extracted by ➤ {CREDIT}"
-                )
-
-                # ── Handle PDF items ──────────────────────────────────────
-                if vtype == "pdf" and want_pdf:
-                    pr = await download_pdf(url, out_path)
-                    if pr:
-                        await bot_client.send_document(
-                            channel_id, document=pr, caption=cc1)
-                        os.remove(pr)
-                        success += 1
-                    else:
-                        failed += 1
-                    for suffix, purl in class_pdfs:
-                        if not purl:
-                            continue
-                        pr2 = await download_pdf(purl, f"{out_path}{suffix}")
-                        if pr2:
-                            await bot_client.send_document(
-                                channel_id, document=pr2, caption=cc1)
-                            os.remove(pr2)
-                    continue
-
-                # ── Handle YouTube ────────────────────────────────────────
-                if vtype == "youtube":
-                    ytf = f"bv*[height<={prefer_quality[:-1]}][ext=mp4]+ba[ext=m4a]/b[height<=?{prefer_quality[:-1]}]"
-                    cmd = (
-                        f'yt-dlp --cookies {cookies_file_path} '
-                        f'--extractor-args "youtube:player_client=android" '
-                        f'-f "{ytf}" -R 25 --fragment-retries 25 '
-                        f'"{url}" -o "{out_path}.mp4"'
-                    )
-                    await bot_client.send_message(channel_id,
-                        f"⬇️ YouTube: `{title[:60]}`\n`{i}/{total}`")
-                    filename = await helper.download_video(url, cmd, out_path)
-                    if filename:
-                        await helper.send_vid(
-                            bot_client, m, cc, filename, "/d", name,
-                            prog_msg, channel_id, watermark_text=batch_watermark)
-                        success += 1
-                    else:
-                        failed += 1
-                    await asyncio.sleep(1)
-                    continue
-
-                # ── Handle regular video (HLS / MP4 / encrypted) ─────────
-                if 'encrypted.m' in (url or ""):
-                    appxkey  = url.split('*')[1]
-                    url      = url.split('*')[0]
-                    res_file = await helper.download_and_decrypt_video(url, "", out_path, appxkey)
-                else:
-                    q_num = prefer_quality.replace("p", "")
-                    ytf   = f"b[height<={q_num}]/bv[height<={q_num}]+ba/b/bv+ba"
-
-                    # Every AppX CDN byte-range requires Referer + UA,
-                    # otherwise follow-up ranges 403 and the file truncates.
-                    header_args = (
-                        f'--add-header "Referer: {MEDIA_REFERER}" '
-                        f'--add-header "User-Agent: {MEDIA_UA}" '
-                    )
-
-                    if _is_mp4_url(url) or url.lower().split("?")[0].endswith(".mp4"):
-                        # Direct mp4 (pre-signed static-db / appx-content-v2)
-                        cmd = (
-                            f'yt-dlp {header_args} '
-                            f'-f "{ytf}" -R 25 --fragment-retries 25 '
-                            f'"{url}" -o "{out_path}.mp4"'
-                        )
-                    else:
-                        # HLS / m3u8 — same headers, plus fragment concurrency
-                        cmd = (
-                            f'yt-dlp {header_args} '
-                            f'-f "{ytf}" --concurrent-fragments 16 --no-part '
-                            f'-R 25 --fragment-retries 25 '
-                            f'"{url}" -o "{out_path}.mp4"'
-                        )
-                    res_file = await helper.download_video(url, cmd, out_path)
-
-                if res_file:
-                    await helper.send_vid(
-                        bot_client, m, cc, res_file, "/d", name,
-                        prog_msg, channel_id, watermark_text=batch_watermark)
-                    success += 1
-                else:
-                    # Fallback: try our internal downloader
-                    ok = await download_item(
-                        vtitle or title, url, xor_key, vtype, out_path,
-                        hdr=hdr, class_pdfs=class_pdfs, want_pdf=want_pdf,
-                        all_candidates=all_candidates)
-                    if ok:
-                        for ext in ["mp4", "mkv", "webm", "ts"]:
-                            fpath = f"{out_path}.{ext}"
-                            if os.path.exists(fpath):
-                                await helper.send_vid(
-                                    bot_client, m, cc, fpath, "/d", name,
-                                    prog_msg, channel_id, watermark_text=batch_watermark)
-                                break
-                        success += 1
-                    else:
-                        await bot_client.send_message(
-                            channel_id,
-                            f"⚠️ **Failed:** `{str(i).zfill(3)}) {title[:60]}`"
-                        )
-                        failed += 1
-
-                await asyncio.sleep(1)
-
-            # ── Course complete ────────────────────────────────────────────
             await bot_client.send_message(
                 channel_id,
                 f"<b>-┈━═.•° ✅ Completed ✅ °•.═━┈-</b>\n"
@@ -1895,14 +2125,14 @@ async def appx_main_flow(bot_client: Client, m: Message, user_id_tg: int):
                 f"<blockquote>"
                 f"✅ Success: {success}\n"
                 f"❌ Failed:  {failed}\n"
-                f"📦 Total:   {total}"
+                f"📦 Total:   {len(lectures)}"
                 f"</blockquote>"
             )
 
     processing_request[user_id_tg] = False
 
 # ══════════════════════════════════════════════════════
-#  STANDARD BOT HANDLERS (from template)
+#  STANDARD BOT HANDLERS
 # ══════════════════════════════════════════════════════
 
 m_file_path = "main.py"
@@ -2147,8 +2377,6 @@ async def cmd_callback(client, cq):
 
 @bot.on_callback_query(filters.regex("upgrade_command"))
 async def upgrade_callback(client, cq):
-    uid   = cq.from_user.id
-    fname = cq.from_user.first_name
     keyboard = InlineKeyboardMarkup([[
         InlineKeyboardButton("📞 Get Access", url=f"tg://openmessage?user_id={OWNER}"),
         InlineKeyboardButton("🔙 Back", callback_data="back_main")
@@ -2220,7 +2448,6 @@ async def send_logs(client: Client, m: Message):
 async def appx_handler(bot_client: Client, m: Message):
     user_id = m.from_user.id
 
-    # Auth check
     bot_info = await bot_client.get_me()
     if not db.is_user_authorized(user_id, bot_info.username):
         await m.reply_text(
