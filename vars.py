@@ -5,6 +5,8 @@ from os import environ
 API_ID    = int(environ.get("API_ID", "21866171"))
 API_HASH  = environ.get("API_HASH", "5788dba8f23fade5edda55948e985f06")
 BOT_TOKEN = environ.get("BOT_TOKEN", "")
+APPX_PROXY_WORKER_URL = os.getenv("APPX_PROXY_WORKER_URL", "")
+APPX_PROXY_TOKEN      = os.getenv("APPX_PROXY_TOKEN", "")
 
 OWNER  = int(environ.get("OWNER", "1289248746"))
 CREDIT = environ.get("CREDIT", "MRBERLIN")
