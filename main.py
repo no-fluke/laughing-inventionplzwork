@@ -1280,20 +1280,36 @@ async def _download_single_url(url: str, vtype: str, xor_key: str,
     if _is_mp4_url(url) or url.lower().split("?")[0].endswith(".mp4"):
         mp4_hdrs = _mp4_headers(url)
 
-        # FIX: skip HEAD check for signed CDN URLs — they reject HEAD
-        # even when GET works (static-db.appx.co.in with Signature= param)
+        # Signed CDN URLs (Signature= / static-db.appx.co.in) must NOT go
+        # through yt-dlp at all: yt-dlp makes an internal info-extraction
+        # GET before handing off to aria2c, and that request adds its own
+        # default headers on top of --add-header, giving the CDN a
+        # mismatched header set → 404.  Pure aiohttp sends exactly the
+        # headers we build — nothing more — so use it as the primary method
+        # for signed URLs and only fall back to yt-dlp if it fails.
+        is_signed = any(p in url for p in ("Signature=", "Expires=", "token=", "auth="))
+
+        if is_signed:
+            # Primary: aiohttp (exact header control)
+            result = await direct_stream_download(url, out_path)
+            if result:
+                return result
+            # Fallback: yt-dlp native (no external downloader — avoids the
+            # double-request that aria2c mode introduces)
+            result = await ytdlp_download(url, out_path, extra_headers=mp4_hdrs)
+            if result:
+                return result
+            return None
+
+        # Unsigned MP4 — original order: yt-dlp first, aiohttp fallback
         if not await _check_url_fresh(url, mp4_hdrs):
             print(f"[MP4] URL check failed — skipping")
             return None
 
-        # Method 1: ytdlp with external downloader (aria2c/curl)
-        # This is the key fix — external downloaders send headers exactly,
-        # no duplication unlike yt-dlp's internal downloader
         result = await ytdlp_download(url, out_path, extra_headers=mp4_hdrs)
         if result:
             return result
 
-        # Method 2: aiohttp direct stream (also no header duplication)
         result = await direct_stream_download(url, out_path)
         if result:
             return result
@@ -1827,17 +1843,23 @@ async def run_lecture_loop(
             url      = url.split('*')[0]
             res_file = await helper.download_and_decrypt_video(url, "", out_path, appxkey)
         else:
-            # Route ALL MP4 URLs through ytdlp_download which now uses
-            # aria2c/curl as external downloader — fixes duplicate header 404
             if _is_mp4_url(url) or url.lower().split("?")[0].endswith(".mp4"):
                 mp4_hdrs = _mp4_headers(url)
-                res_file = await ytdlp_download(url, out_path, extra_headers=mp4_hdrs)
-                if not res_file:
-                    # aiohttp fallback — also no header duplication
+                # Signed CDN URLs (Signature= etc.): aiohttp first — yt-dlp's
+                # info-extraction pass adds extra headers that cause 404.
+                if any(p in url for p in ("Signature=", "Expires=", "token=", "auth=")):
                     res_file = await direct_stream_download(url, out_path)
+                    if not res_file:
+                        res_file = await ytdlp_download(url, out_path, extra_headers=mp4_hdrs)
+                else:
+                    res_file = await ytdlp_download(url, out_path, extra_headers=mp4_hdrs)
+                    if not res_file:
+                        res_file = await direct_stream_download(url, out_path)
             else:
-                q_num = prefer_quality.replace("p", "")
-                ytf   = f"b[height<={q_num}]/bv[height<={q_num}]+ba/b/bv+ba"
+                # HLS/m3u8 — no -f flag; let yt-dlp auto-pick the best stream.
+                # (ytf / -f must NOT be passed for non-YouTube URLs: yt-dlp
+                # would try to fetch a format manifest that doesn't exist on a
+                # plain MP4/HLS CDN and get a 404.)
                 res_file = await ytdlp_download(url, out_path, extra_headers={
                     "Referer":    MEDIA_REFERER,
                     "User-Agent": MEDIA_UA,
