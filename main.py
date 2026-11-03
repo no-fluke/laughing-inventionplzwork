@@ -573,7 +573,8 @@ def decrypt_all_links(d: dict) -> list:
     if dl:
         _add("download_link", dl)
 
-    results.sort(key=lambda x: quality_rank.get(x[0], 99))
+    # Keep insertion order (encrypted_links first, then download_links).
+    # Caller reorders by preference — don't sort here.
     return results
 
 
@@ -664,15 +665,17 @@ async def resolve_video(session, api_base, course_id, video_id, hdr,
         return (title, d["embed_url"],
                 None, "youtube", class_pdfs, all_candidates)
 
-    prefer_order = [prefer_quality, "1080p", "720p", "480p", "360p", "240p",
-                    "144p", "file_link", "download_link"]
+    # ── Build a quality → url map (video only, no DRM, no PDF) ──────────
+    ALL_QUALITIES = ["1080p", "720p", "480p", "360p", "240p", "144p"]
     by_quality: dict = {}
     for qlabel, cand_url in all_candidates:
         if cand_url and ".pdf" not in cand_url and not _is_drm_url(cand_url):
             if qlabel not in by_quality:
                 by_quality[qlabel] = cand_url
 
-    chosen_url = None
+    # ── Pick primary URL: preferred quality first ────────────────────────
+    prefer_order = [prefer_quality] + [q for q in ALL_QUALITIES if q != prefer_quality] + ["file_link", "download_link"]
+    chosen_url   = None
     for q in prefer_order:
         if q in by_quality:
             chosen_url = by_quality[q]
@@ -682,7 +685,29 @@ async def resolve_video(session, api_base, course_id, video_id, hdr,
 
     if chosen_url:
         vtype = "mp4" if _is_mp4_url(chosen_url) else "hls"
-        return title, chosen_url, None, vtype, class_pdfs, all_candidates
+
+        # ── Reorder all_candidates: preferred → lower → higher ──────────
+        # This makes download_item's fallback cascade go preferred first,
+        # then degrade gracefully rather than jumping to 1080p on failure.
+        pref_idx = ALL_QUALITIES.index(prefer_quality) if prefer_quality in ALL_QUALITIES else 1
+        lower    = ALL_QUALITIES[pref_idx + 1:]          # e.g. 480p, 360p, 240p, 144p
+        higher   = list(reversed(ALL_QUALITIES[:pref_idx]))  # e.g. 1080p (above 720p)
+        fallback_order = [prefer_quality] + lower + higher + ["file_link", "download_link"]
+
+        seen_urls: set  = set()
+        ordered: list   = []
+        for q in fallback_order:
+            url_q = by_quality.get(q)
+            if url_q and url_q not in seen_urls:
+                seen_urls.add(url_q)
+                ordered.append((q, url_q))
+        # Append anything not yet covered (unknown quality labels)
+        for qlabel, cand_url in all_candidates:
+            if cand_url not in seen_urls and not _is_drm_url(cand_url):
+                seen_urls.add(cand_url)
+                ordered.append((qlabel, cand_url))
+
+        return title, chosen_url, None, vtype, class_pdfs, ordered
 
     quality_rank = {"1080p": 0, "720p": 1, "480p": 2, "360p": 3, "240p": 4}
     enc_links = sorted(
