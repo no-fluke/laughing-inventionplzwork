@@ -485,11 +485,13 @@ def _is_mp4_url(url: str) -> bool:
     if not url:
         return False
     lower = url.lower()
+    path  = lower.split("?")[0]
+    if path.endswith(".pdf"):          # never treat PDF URLs as mp4
+        return False
     if "static-db.appx.co.in" in lower:
         return True
     if "appx-content-v2.classx.co.in" in lower:
         return True
-    path = lower.split("?")[0]
     if path.endswith(".mp4"):
         return True
     return False
@@ -621,15 +623,23 @@ def _extract_class_pdfs(d: dict) -> list:
     """
     Returns list of (suffix, url) for ALL PDFs on a lecture item.
     Both pdf_link and pdf_link2 are extracted.
+    Falls back to pdf_summary_link / pdf2_summary_link if decryption yields nothing.
     e.g. [("", url1), ("_2", url2)]
     """
     pdfs = []
-    p1  = _resolve_pdf_url(d.get("pdf_link",  ""), d.get("pdf_encryption_key",  ""))
-    p2  = _resolve_pdf_url(d.get("pdf_link2", ""), d.get("pdf2_encryption_key", ""))
+
+    p1 = _resolve_pdf_url(d.get("pdf_link", ""), d.get("pdf_encryption_key", ""))
+    if not p1:
+        p1 = d.get("pdf_summary_link", "")  # direct URL fallback
     if p1:
         pdfs.append(("", p1))
+
+    p2 = _resolve_pdf_url(d.get("pdf_link2", ""), d.get("pdf2_encryption_key", ""))
+    if not p2:
+        p2 = d.get("pdf2_summary_link", "")  # direct URL fallback
     if p2:
         pdfs.append(("_2", p2))
+
     return pdfs
 
 
@@ -1105,7 +1115,10 @@ async def ytdlp_download(url: str, out_path: str,
         except FileNotFoundError:
             return -1
 
-    if _ARIA2C:
+    is_proxy = url.startswith(PROXY_BASE)
+
+    if _ARIA2C and not is_proxy:
+        # aria2c uses parallel range requests — incompatible with proxy
         ret = await _run(*base_args,
             "--external-downloader", "aria2c",
             "--downloader-args", "aria2c:-x 16 -j 32 -k 1M",
@@ -1149,12 +1162,17 @@ async def download_pdf(url: str, out_path: str):
         async with aiohttp.ClientSession(connector=connector) as session:
             async with session.get(url, headers=PDF_HEADERS,
                                    timeout=aiohttp.ClientTimeout(total=120)) as resp:
-                ct = resp.headers.get("Content-Type", "").lower()
-                if resp.status == 200 and ("pdf" in ct or "octet" in ct or resp.content_length):
-                    async with aiofiles.open(out, "wb") as f:
-                        await f.write(await resp.read())
-                    if os.path.exists(out) and os.path.getsize(out) > 512:
-                        return out
+                # Accept any successful response — CDN may return video/mp4
+                # or application/octet-stream as content-type for PDFs
+                if resp.status in (200, 206):
+                    data = await resp.read()
+                    if len(data) > 512:
+                        async with aiofiles.open(out, "wb") as f:
+                            await f.write(data)
+                        if os.path.exists(out) and os.path.getsize(out) > 512:
+                            return out
+                else:
+                    print(f"[PDF] HTTP {resp.status} for {url[:80]}")
     except Exception as e:
         print(f"[PDF] aiohttp failed: {e}")
     if _YTDLP:
@@ -1177,11 +1195,13 @@ async def direct_stream_download(url: str, out_path: str):
     out      = f"{out_path}.mp4"
 
     try:
+        # Proxy streams full file without range support — need a long sock_read
+        sock_read = 1800 if url.startswith(PROXY_BASE) else 90
         connector = aiohttp.TCPConnector(ssl=False, limit=4, keepalive_timeout=60)
         async with aiohttp.ClientSession(connector=connector) as dl_sess:
             async with dl_sess.get(
                     url, headers=mp4_hdrs,
-                    timeout=aiohttp.ClientTimeout(total=3600, connect=15, sock_read=90),
+                    timeout=aiohttp.ClientTimeout(total=3600, connect=15, sock_read=sock_read),
                     allow_redirects=True) as resp:
                 if resp.status == 404:
                     print(f"[Direct] 404 — URL expired or not found")
