@@ -109,6 +109,16 @@ MEDIA_UA      = "Dalvik/2.1.0 (Linux; U; Android 11; RMX2001 Build/RP1A.200720.0
 
 cookies_file_path = os.getenv("cookies_file_path", "youtube_cookies.txt")
 
+# ── Proxy for signed CDN mp4 URLs that fail direct download ──────────
+PROXY_BASE = "https://crispy-sporkvercel.vercel.app/?url="
+
+
+def proxy_mp4_url(url: str) -> str:
+    """Wrap a signed CDN mp4 URL through the middleman proxy."""
+    if not url:
+        return url
+    return PROXY_BASE + urllib.parse.quote(url, safe="")
+
 # ══════════════════════════════════════════════════════
 #  BOT INIT
 # ══════════════════════════════════════════════════════
@@ -694,20 +704,28 @@ async def resolve_video(session, api_base, course_id, video_id, hdr,
         vtype = "mp4" if _is_mp4_url(chosen_url) else "hls"
 
         # ── Reorder all_candidates: preferred → lower → higher ──────────
-        # This makes download_item's fallback cascade go preferred first,
-        # then degrade gracefully rather than jumping to 1080p on failure.
+        # For each quality, ALL its URLs (path, backup_url, backup_url2)
+        # are tried before dropping to the next lower quality.
         pref_idx = ALL_QUALITIES.index(prefer_quality) if prefer_quality in ALL_QUALITIES else 1
-        lower    = ALL_QUALITIES[pref_idx + 1:]          # e.g. 480p, 360p, 240p, 144p
-        higher   = list(reversed(ALL_QUALITIES[:pref_idx]))  # e.g. 1080p (above 720p)
+        lower    = ALL_QUALITIES[pref_idx + 1:]
+        higher   = list(reversed(ALL_QUALITIES[:pref_idx]))
         fallback_order = [prefer_quality] + lower + higher + ["file_link", "download_link"]
 
-        seen_urls: set  = set()
-        ordered: list   = []
+        # Build a map of quality → ALL its URLs (not just the first one)
+        by_quality_all: dict = {}
+        for qlabel, cand_url in all_candidates:
+            if not _is_drm_url(cand_url):
+                by_quality_all.setdefault(qlabel, []).append(cand_url)
+
+        seen_urls: set = set()
+        ordered: list  = []
+
         for q in fallback_order:
-            url_q = by_quality.get(q)
-            if url_q and url_q not in seen_urls:
-                seen_urls.add(url_q)
-                ordered.append((q, url_q))
+            for url_q in by_quality_all.get(q, []):
+                if url_q not in seen_urls:
+                    seen_urls.add(url_q)
+                    ordered.append((q, url_q))
+
         # Append anything not yet covered (unknown quality labels)
         for qlabel, cand_url in all_candidates:
             if cand_url not in seen_urls and not _is_drm_url(cand_url):
@@ -1233,24 +1251,22 @@ async def _download_single_url(url: str, vtype: str, xor_key: str,
     }
 
     if _is_mp4_url(url) or url.lower().split("?")[0].endswith(".mp4"):
-        mp4_hdrs = _mp4_headers(url)
+        # Always route mp4 URLs through proxy
+        proxied    = proxy_mp4_url(url)
+        proxy_hdrs = {"User-Agent": MEDIA_UA, "Referer": MEDIA_REFERER}
+        print(f"[MP4] Routing through proxy…")
 
-        # FIX 2: Check URL is alive before trying any downloader
-        print(f"[MP4] Checking URL freshness…")
-        if not await _check_url_fresh(url, mp4_hdrs):
-            print(f"[MP4] URL is dead (403/404) — skipping")
-            return None
-
-        # Method 1: aiohttp with 1 MB chunks (fastest start, no subprocess)
-        result = await direct_stream_download(url, out_path)
+        # Method 1: aiohttp via proxy
+        result = await direct_stream_download(proxied, out_path)
         if result:
             return result
 
-        # Method 2: yt-dlp with correct headers
-        result = await ytdlp_download(url, out_path, extra_headers=mp4_hdrs)
+        # Method 2: yt-dlp via proxy
+        result = await ytdlp_download(proxied, out_path, extra_headers=proxy_hdrs)
         if result:
             return result
 
+        print(f"[MP4] Proxy methods failed for this URL")
         return None
 
     elif ".m3u8" in url.lower():
