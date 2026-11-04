@@ -125,10 +125,17 @@ def proxy_mp4_url(url: str) -> str:
 
 
 # ══════════════════════════════════════════════════════
-#  BRAND NAME  (v1.3 — set once per session via /appx setup)
+#  BRAND NAME  (v1.4 — per-user dict, keyed by Telegram user_id)
 # ══════════════════════════════════════════════════════
-# Updated at runtime in appx_main_flow. Used in all captions and quiz watermarks.
-_BRAND_NAME: str = "YourChannel"   # fallback default
+# Each user gets their own brand name; no cross-user leakage.
+_BRAND_NAMES: dict[int, str] = {}   # user_id_tg -> brand name
+_DEFAULT_BRAND: str = "YourChannel"
+
+def get_brand(user_id: int) -> str:
+    return _BRAND_NAMES.get(user_id, _DEFAULT_BRAND)
+
+def set_brand(user_id: int, name: str) -> None:
+    _BRAND_NAMES[user_id] = name
 
 
 # ══════════════════════════════════════════════════════
@@ -328,11 +335,12 @@ def _extract_user_id_from_jwt(token: str) -> str:
 async def appx_login(bot_client: Client, m: Message, api_base: str):
     """Interactive AppX login. Returns (token, user_id, user_name)."""
     ask = await m.reply_text(
-        "**🔐 AppX Login**\n\n"
-        "Choose login method:\n"
-        "**1** — Email / Password\n"
-        "**2** — JWT Token\n\n"
-        "Reply with `1` or `2`"
+        "🔐 **AppX Login**\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "Choose your login method:\n\n"
+        "**1️⃣** — Email / Password\n"
+        "**2️⃣** — JWT Token\n\n"
+        "<blockquote>Reply with `1` or `2`</blockquote>"
     )
     try:
         choice_msg: Message = await bot_client.listen(m.chat.id, timeout=60)
@@ -344,7 +352,11 @@ async def appx_login(bot_client: Client, m: Message, api_base: str):
         return None, None, None
 
     if choice in ("2", "JWT", "jwt"):
-        tok_ask = await m.reply_text("**Send your JWT Token:**")
+        tok_ask = await m.reply_text(
+            "🔑 **JWT Token**\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            "<blockquote>Paste your JWT token below.</blockquote>"
+        )
         try:
             tok_msg: Message = await bot_client.listen(m.chat.id, timeout=120)
             token = tok_msg.text.strip() if tok_msg.text else ""
@@ -359,7 +371,10 @@ async def appx_login(bot_client: Client, m: Message, api_base: str):
         user_id = _extract_user_id_from_jwt(token)
         if not user_id:
             uid_ask = await m.reply_text(
-                "⚠️ Could not extract User ID from token.\n**Send your User ID manually:**")
+                "⚠️ **User ID Not Found**\n"
+                "━━━━━━━━━━━━━━━━━━━━\n"
+                "<blockquote>Could not extract User ID from token.\nPlease send your User ID manually.</blockquote>"
+            )
             try:
                 uid_msg: Message = await bot_client.listen(m.chat.id, timeout=60)
                 user_id = uid_msg.text.strip() if uid_msg.text else ""
@@ -374,7 +389,11 @@ async def appx_login(bot_client: Client, m: Message, api_base: str):
         return token, user_id, f"User #{user_id}"
 
     # Email/Password login
-    email_ask = await m.reply_text("**📧 Send your Email / Mobile:**")
+    email_ask = await m.reply_text(
+        "📧 **Email / Mobile**\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "<blockquote>Send your registered email address or mobile number.</blockquote>"
+    )
     try:
         email_msg: Message = await bot_client.listen(m.chat.id, timeout=120)
         email = email_msg.text.strip() if email_msg.text else ""
@@ -384,7 +403,11 @@ async def appx_login(bot_client: Client, m: Message, api_base: str):
         await email_ask.edit_text("⏰ Timed out.")
         return None, None, None
 
-    pass_ask = await m.reply_text("**🔒 Send your Password:**")
+    pass_ask = await m.reply_text(
+        "🔒 **Password**\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "<blockquote>Send your account password.</blockquote>"
+    )
     try:
         pass_msg: Message = await bot_client.listen(m.chat.id, timeout=120)
         password = pass_msg.text.strip() if pass_msg.text else ""
@@ -1678,10 +1701,11 @@ async def download_test_series(bot_client: Client, m: Message,
             qfile = save_quiz_html(questions, out_path, tname, brand_name=brand_name)
             if qfile:
                 caption = (
-                    f"📝 `{os.path.basename(qfile)}`\n"
-                    f"`{len(questions)} questions`\n"
-                    f"<blockquote>Batch: {cname}</blockquote>\n"
-                    f"Extracted by ➤ {brand_name or CREDIT}"
+                    f"📝 **{tname[:55]}**\n"
+                    f"┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
+                    f"❓ `{len(questions)} Questions`\n"
+                    f"<blockquote>📂 {cname}</blockquote>\n"
+                    f"✦ **{brand_name or CREDIT}**"
                 )
                 await bot_client.send_document(
                     channel_id,
@@ -1771,14 +1795,18 @@ async def run_lecture_loop(
 
         # ── v1.3 captions include brand name ─────────────────────────
         cc  = (
-            f"[🎥] `{str(i).zfill(3)}) {title[:60]} [{prefer_quality}]`\n"
-            f"<blockquote>Batch: {cname}</blockquote>\n"
-            f"Extracted by ➤ {brand_tag}"
+            f"🎬 **{title[:55]}**\n"
+            f"┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
+            f"📦 `#{str(i).zfill(3)}`  •  🎞 `{prefer_quality}`\n"
+            f"<blockquote>📂 {cname}</blockquote>\n"
+            f"✦ **{brand_tag}**"
         )
         cc1 = (
-            f"[📕] `{str(i).zfill(3)}) {title[:60]}.pdf`\n"
-            f"<blockquote>Batch: {cname}</blockquote>\n"
-            f"Extracted by ➤ {brand_tag}"
+            f"📄 **{title[:55]}**\n"
+            f"┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
+            f"📦 `#{str(i).zfill(3)}`  •  📕 `PDF`\n"
+            f"<blockquote>📂 {cname}</blockquote>\n"
+            f"✦ **{brand_tag}**"
         )
 
         # ── Quiz detection ────────────────────────────────────────────
@@ -1801,10 +1829,11 @@ async def run_lecture_loop(
                             channel_id,
                             document=qfile,
                             caption=(
-                                f"📝 `{title[:60]}`\n"
-                                f"`{len(questions)} questions`\n"
-                                f"`{i}/{total}` | Batch: {cname}\n"
-                                f"Extracted by ➤ {brand_tag}"
+                                f"📝 **{title[:55]}**\n"
+                                f"┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
+                                f"❓ `{len(questions)} Questions`  •  📦 `#{i}/{total}`\n"
+                                f"<blockquote>📂 {cname}</blockquote>\n"
+                                f"✦ **{brand_tag}**"
                             )
                         )
                         os.remove(qfile)
@@ -1844,9 +1873,11 @@ async def run_lecture_loop(
                 pr2 = await download_pdf(purl, f"{out_path}_extra_{idx2}")
                 if pr2:
                     cc_extra = (
-                        f"[📕] `{str(i).zfill(3)}) {title[:55]}_p{idx2}.pdf`\n"
-                        f"<blockquote>Batch: {cname}</blockquote>\n"
-                        f"Extracted by ➤ {brand_tag}"
+                        f"📄 **{title[:50]} (Part {idx2})**\n"
+                        f"┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
+                        f"📦 `#{str(i).zfill(3)}`  •  📕 `PDF`\n"
+                        f"<blockquote>📂 {cname}</blockquote>\n"
+                        f"✦ **{brand_tag}**"
                     )
                     await bot_client.send_document(channel_id, document=pr2, caption=cc_extra)
                     os.remove(pr2)
@@ -1962,10 +1993,14 @@ async def _ask_quality_and_watermark(bot_client: Client, m: Message,
     prefer_quality = "720p"
     if want_video:
         q_ask = await m.reply_text(
-            "**🎬 Video quality?**\n"
-            "`1` 1080p  `2` 720p (default)  `3` 480p\n"
-            "`4` 360p   `5` 240p\n"
-            "_Send choice (20s timeout → 720p):_"
+            "🎬 **Video Quality**\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            "`1` — 1080p\n"
+            "`2` — 720p _(default)_\n"
+            "`3` — 480p\n"
+            "`4` — 360p\n"
+            "`5` — 240p\n"
+            "<blockquote>_⏳ 20s timeout → 720p_</blockquote>"
         )
         try:
             q_msg: Message = await bot_client.listen(m.chat.id, timeout=20)
@@ -1979,8 +2014,12 @@ async def _ask_quality_and_watermark(bot_client: Client, m: Message,
             await q_ask.delete()
 
     wm_ask = await m.reply_text(
-        "**🖊️ Add watermark text?**\n"
-        "Send text (e.g. `@YourChannel`) or `/d` to skip.\n_20s timeout → skip:_"
+        "🖊️ **Video Watermark**\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "<blockquote>Send watermark text to embed on videos.\n"
+        "Example: `@YourChannel`\n\n"
+        "Send `/d` to skip.\n"
+        "_⏳ 20s timeout → skip_</blockquote>"
     )
     try:
         wm_msg: Message = await bot_client.listen(m.chat.id, timeout=20)
@@ -1999,15 +2038,14 @@ async def _ask_quality_and_watermark(bot_client: Client, m: Message,
 # ══════════════════════════════════════════════════════
 
 async def appx_main_flow(bot_client: Client, m: Message, user_id_tg: int):
-    global _BRAND_NAME
-
-    # ── Step 0 (NEW v1.3): Brand / Channel name ───────────────────────────
+    # ── Step 0 (v1.4): Brand / Channel name — stored per user ────────────
     brand_ask = await m.reply_text(
-        "**✏️ Enter your brand / channel name**\n\n"
-        "<blockquote>This name will appear in all captions and quiz watermarks.\n"
-        "Examples: `@MrBerlin`, `Berlin Academy`, `@YourChannel`\n\n"
-        "Send `/d` to use the default (`YourChannel`)</blockquote>\n"
-        "_30s timeout → default:_"
+        "✏️ **Brand / Channel Name**\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "<blockquote>This name appears in all captions and quiz watermarks.\n\n"
+        "Examples: `@MrBerlin` · `Berlin Academy` · `@YourChannel`\n\n"
+        "Send `/d` to keep default (`YourChannel`)\n"
+        "_⏳ 30s timeout → default_</blockquote>"
     )
     try:
         brand_msg: Message = await bot_client.listen(m.chat.id, timeout=30)
@@ -2019,18 +2057,21 @@ async def appx_main_flow(bot_client: Client, m: Message, user_id_tg: int):
         await brand_ask.delete()
 
     if brand_raw and brand_raw != "/d":
-        _BRAND_NAME = brand_raw
-    # else keep existing / default value
+        set_brand(user_id_tg, brand_raw)
+    # else keep the user's existing / default value
 
+    _BRAND_NAME = get_brand(user_id_tg)   # local alias for the rest of this flow
     await m.reply_text(f"✅ **Brand name set to:** `{_BRAND_NAME}`")
 
     # ── Step 1: API Domain ────────────────────────────────────────────────
     domain_ask = await m.reply_text(
-        "**🌐 Enter API Domain**\n\n"
-        "<blockquote>Examples:\n"
+        "🌐 **API Domain**\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "<blockquote>Enter your AppX API domain.\n\n"
+        "Examples:\n"
         "• `parmaracademyapi.teachx.in`\n"
         "• `e1coachingcenterapi.classx.co.in`\n\n"
-        "Send **without** `https://`</blockquote>"
+        "_Send without_ `https://`</blockquote>"
     )
     try:
         domain_msg: Message = await bot_client.listen(m.chat.id, timeout=120)
@@ -2085,14 +2126,15 @@ async def appx_main_flow(bot_client: Client, m: Message, user_id_tg: int):
 
             # ── Step 4: What to download? ──────────────────────────────────
             dl_type_ask = await m.reply_text(
-                "**What to download?**\n\n"
-                "`1` — Videos only\n"
-                "`2` — PDFs only\n"
-                "`3` — Everything (videos + PDFs + quizzes)\n"
-                "`4` — Quizzes only\n"
-                "`5` — Test Series\n"
-                "`6` — 🔥 Download EVERYTHING (videos + PDFs + quizzes + ALL test series)\n\n"
-                "_Send a number (20s timeout → default 3):_"
+                "📥 **What to Download?**\n"
+                "━━━━━━━━━━━━━━━━━━━━\n"
+                "`1` — 🎬 Videos only\n"
+                "`2` — 📄 PDFs only\n"
+                "`3` — 📦 Everything _(videos + PDFs + quizzes)_\n"
+                "`4` — 📝 Quizzes only\n"
+                "`5` — 🧪 Test Series\n"
+                "`6` — 🔥 Download EVERYTHING\n"
+                "<blockquote>_⏳ 20s timeout → default 3_</blockquote>"
             )
             try:
                 dl_msg: Message = await bot_client.listen(m.chat.id, timeout=20)
@@ -2105,9 +2147,12 @@ async def appx_main_flow(bot_client: Client, m: Message, user_id_tg: int):
 
             # ── Step 5: Upload destination ─────────────────────────────────
             chan_ask = await m.reply_text(
-                "**Upload to channel/group?**\n"
-                "Send Channel ID (e.g. `-100xxxxxxxxxx`) or `/d` to upload here.\n"
-                "_20s timeout → upload here:_"
+                "📤 **Upload Destination**\n"
+                "━━━━━━━━━━━━━━━━━━━━\n"
+                "<blockquote>Send a Channel / Group ID to upload there.\n"
+                "Example: `-100xxxxxxxxxx`\n\n"
+                "Send `/d` to upload here.\n"
+                "_⏳ 20s timeout → upload here_</blockquote>"
             )
             try:
                 chan_msg: Message = await bot_client.listen(m.chat.id, timeout=20)
@@ -2252,7 +2297,11 @@ async def appx_main_flow(bot_client: Client, m: Message, user_id_tg: int):
             await m.reply_text(f"✅ Found **{len(lectures)}** lectures")
 
             start_ask = await m.reply_text(
-                f"**Start from lecture number?** [1-{len(lectures)}, default 1]\n_20s timeout:_"
+                f"▶️ **Start From Lecture**\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n"
+                f"<blockquote>Enter lecture number to start from.\n"
+                f"Range: `1` – `{len(lectures)}` _(default: 1)_\n"
+                f"_⏳ 20s timeout → start from 1_</blockquote>"
             )
             try:
                 start_msg: Message = await bot_client.listen(m.chat.id, timeout=20)
