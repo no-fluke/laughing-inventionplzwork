@@ -2154,55 +2154,6 @@ async def appx_main_flow(bot_client: Client, m: Message, user_id_tg: int):
                 dl_choice = "3"
                 await dl_type_ask.delete()
 
-            # ── Common: upload destination & watermark (shared by all modes) ─
-            chan_ask = await m.reply_text(
-                "**Upload to channel/group?**\n"
-                "Send Channel ID (e.g. `-100xxxxxxxxxx`) or `/d` to upload here.\n"
-                "_20s timeout → upload here:_"
-            )
-            try:
-                chan_msg: Message = await bot_client.listen(m.chat.id, timeout=20)
-                raw_chan = chan_msg.text.strip() if chan_msg.text else "/d"
-                await chan_msg.delete()
-                await chan_ask.delete()
-            except asyncio.TimeoutError:
-                raw_chan = "/d"
-                await chan_ask.delete()
-
-            channel_id = (m.chat.id if "/d" in raw_chan
-                          else (int(raw_chan) if raw_chan.lstrip("-").isdigit() else m.chat.id))
-
-            wm_ask = await m.reply_text(
-                "**🖊️ Add watermark text?**\n"
-                "Send text (e.g. `@YourChannel`) or `/d` to skip.\n_20s timeout:_"
-            )
-            try:
-                wm_msg: Message = await bot_client.listen(m.chat.id, timeout=20)
-                raw_wm = wm_msg.text.strip() if wm_msg.text else "/d"
-                await wm_msg.delete()
-                await wm_ask.delete()
-            except asyncio.TimeoutError:
-                raw_wm = "/d"
-                await wm_ask.delete()
-            batch_watermark = None if raw_wm == "/d" else raw_wm
-
-            # ── Per-user brand name for captions & HTML watermark ─────────
-            brand_ask = await m.reply_text(
-                "**🏷️ Brand name for captions & HTML watermark?**\n"
-                "Send your brand/channel name (e.g. `@MyChannel`) or `/d` to use default.\n"
-                "_20s timeout → default:_"
-            )
-            try:
-                brand_msg: Message = await bot_client.listen(m.chat.id, timeout=20)
-                raw_brand = brand_msg.text.strip() if brand_msg.text else "/d"
-                await brand_msg.delete()
-                await brand_ask.delete()
-            except asyncio.TimeoutError:
-                raw_brand = "/d"
-                await brand_ask.delete()
-            session_credit = CREDIT if raw_brand == "/d" else raw_brand
-            user_brand_name[user_id_tg] = session_credit
-
             downloads_dir = os.path.join(tempfile.gettempdir(), "downloads")
             os.makedirs(downloads_dir, exist_ok=True)
 
@@ -2210,6 +2161,72 @@ async def appx_main_flow(bot_client: Client, m: Message, user_id_tg: int):
             #  OPTION 5 — Test Series only
             # ══════════════════════════════════════════════════════
             if dl_choice == "5":
+                # ── Quality ───────────────────────────────────────────────
+                q_ask = await m.reply_text(
+                    "**Video quality?**\n"
+                    "`1` 1080p  `2` 720p (default)  `3` 480p\n"
+                    "`4` 360p   `5` 240p\n"
+                    "_Send choice (20s timeout → 720p):_"
+                )
+                try:
+                    q_msg: Message = await bot_client.listen(m.chat.id, timeout=20)
+                    q_map = {"1":"1080p","2":"720p","3":"480p","4":"360p","5":"240p"}
+                    prefer_quality = q_map.get(q_msg.text.strip() if q_msg.text else "2", "720p")
+                    await q_msg.delete()
+                    await q_ask.delete()
+                except asyncio.TimeoutError:
+                    prefer_quality = "720p"
+                    await q_ask.delete()
+
+                # ── Brand name ────────────────────────────────────────────
+                brand_ask = await m.reply_text(
+                    "**🏷️ Brand name for captions & HTML watermark?**\n"
+                    "Send your brand/channel name (e.g. `@MyChannel`) or `/d` to use default.\n"
+                    "_20s timeout → default:_"
+                )
+                try:
+                    brand_msg: Message = await bot_client.listen(m.chat.id, timeout=20)
+                    raw_brand = brand_msg.text.strip() if brand_msg.text else "/d"
+                    await brand_msg.delete()
+                    await brand_ask.delete()
+                except asyncio.TimeoutError:
+                    raw_brand = "/d"
+                    await brand_ask.delete()
+                session_credit = CREDIT if raw_brand == "/d" else raw_brand
+                user_brand_name[user_id_tg] = session_credit
+
+                # ── Watermark ─────────────────────────────────────────────
+                wm_ask = await m.reply_text(
+                    "**🖊️ Add watermark text?**\n"
+                    "Send text (e.g. `@YourChannel`) or `/d` to skip.\n_20s timeout:_"
+                )
+                try:
+                    wm_msg: Message = await bot_client.listen(m.chat.id, timeout=20)
+                    raw_wm = wm_msg.text.strip() if wm_msg.text else "/d"
+                    await wm_msg.delete()
+                    await wm_ask.delete()
+                except asyncio.TimeoutError:
+                    raw_wm = "/d"
+                    await wm_ask.delete()
+                batch_watermark = None if raw_wm == "/d" else raw_wm
+
+                # ── Destination ───────────────────────────────────────────
+                chan_ask = await m.reply_text(
+                    "**Upload to channel/group?**\n"
+                    "Send Channel ID (e.g. `-100xxxxxxxxxx`) or `/d` to upload here.\n"
+                    "_20s timeout → upload here:_"
+                )
+                try:
+                    chan_msg: Message = await bot_client.listen(m.chat.id, timeout=20)
+                    raw_chan = chan_msg.text.strip() if chan_msg.text else "/d"
+                    await chan_msg.delete()
+                    await chan_ask.delete()
+                except asyncio.TimeoutError:
+                    raw_chan = "/d"
+                    await chan_ask.delete()
+                channel_id = (m.chat.id if "/d" in raw_chan
+                              else (int(raw_chan) if raw_chan.lstrip("-").isdigit() else m.chat.id))
+
                 course_dir = os.path.join(tempfile.gettempdir(), "downloads")
                 os.makedirs(course_dir, exist_ok=True)
                 await download_test_series(
@@ -2228,35 +2245,11 @@ async def appx_main_flow(bot_client: Client, m: Message, user_id_tg: int):
                     "Will download in this order:\n"
                     "1️⃣ All videos + PDFs + lecture quizzes\n"
                     "2️⃣ All test series (every series, every subject, every test)\n\n"
-                    "No further prompts — starting now…"
+                    "⏳ Fetching all lectures first…"
                 )
 
-                # Quality for videos
-                q_ask = await m.reply_text(
-                    "**Video quality?**\n"
-                    "`1` 1080p  `2` 720p (default)  `3` 480p\n"
-                    "`4` 360p   `5` 240p\n"
-                    "_Send choice (20s timeout → 720p):_"
-                )
-                try:
-                    q_msg: Message = await bot_client.listen(m.chat.id, timeout=20)
-                    q_map = {"1":"1080p","2":"720p","3":"480p","4":"360p","5":"240p"}
-                    prefer_quality = q_map.get(q_msg.text.strip() if q_msg.text else "2", "720p")
-                    await q_msg.delete()
-                    await q_ask.delete()
-                except asyncio.TimeoutError:
-                    prefer_quality = "720p"
-                    await q_ask.delete()
-
-                # ── Phase 1: all lectures (video + PDF + quiz) ─────────────
-                await bot_client.send_message(
-                    channel_id,
-                    f"<blockquote><b>📦 Phase 1/2 — Lectures\nBatch: {cname}</b></blockquote>"
-                )
-
+                # ── Fetch all lectures first ───────────────────────────────
                 lec_status = await m.reply_text("⏳ Fetching all lectures…")
-                # For option 6 we collect ALL subjects/topics without prompting.
-                # We temporarily monkey-patch _bot_pick to always return all items.
                 all_lectures: list = []
                 folder_data = await get_folder_contents(session, api_base, cid, -1, hdr)
                 if folder_data:
@@ -2279,7 +2272,80 @@ async def appx_main_flow(bot_client: Client, m: Message, user_id_tg: int):
                             await asyncio.sleep(0.2)
 
                 await lec_status.delete()
-                await m.reply_text(f"✅ Found **{len(all_lectures)}** lectures — starting download…")
+                await m.reply_text(f"✅ Found **{len(all_lectures)}** lectures")
+
+                # ── Quality ───────────────────────────────────────────────
+                q_ask = await m.reply_text(
+                    "**Video quality?**\n"
+                    "`1` 1080p  `2` 720p (default)  `3` 480p\n"
+                    "`4` 360p   `5` 240p\n"
+                    "_Send choice (20s timeout → 720p):_"
+                )
+                try:
+                    q_msg: Message = await bot_client.listen(m.chat.id, timeout=20)
+                    q_map = {"1":"1080p","2":"720p","3":"480p","4":"360p","5":"240p"}
+                    prefer_quality = q_map.get(q_msg.text.strip() if q_msg.text else "2", "720p")
+                    await q_msg.delete()
+                    await q_ask.delete()
+                except asyncio.TimeoutError:
+                    prefer_quality = "720p"
+                    await q_ask.delete()
+
+                # ── Brand name ────────────────────────────────────────────
+                brand_ask = await m.reply_text(
+                    "**🏷️ Brand name for captions & HTML watermark?**\n"
+                    "Send your brand/channel name (e.g. `@MyChannel`) or `/d` to use default.\n"
+                    "_20s timeout → default:_"
+                )
+                try:
+                    brand_msg: Message = await bot_client.listen(m.chat.id, timeout=20)
+                    raw_brand = brand_msg.text.strip() if brand_msg.text else "/d"
+                    await brand_msg.delete()
+                    await brand_ask.delete()
+                except asyncio.TimeoutError:
+                    raw_brand = "/d"
+                    await brand_ask.delete()
+                session_credit = CREDIT if raw_brand == "/d" else raw_brand
+                user_brand_name[user_id_tg] = session_credit
+
+                # ── Watermark ─────────────────────────────────────────────
+                wm_ask = await m.reply_text(
+                    "**🖊️ Add watermark text?**\n"
+                    "Send text (e.g. `@YourChannel`) or `/d` to skip.\n_20s timeout:_"
+                )
+                try:
+                    wm_msg: Message = await bot_client.listen(m.chat.id, timeout=20)
+                    raw_wm = wm_msg.text.strip() if wm_msg.text else "/d"
+                    await wm_msg.delete()
+                    await wm_ask.delete()
+                except asyncio.TimeoutError:
+                    raw_wm = "/d"
+                    await wm_ask.delete()
+                batch_watermark = None if raw_wm == "/d" else raw_wm
+
+                # ── Destination ───────────────────────────────────────────
+                chan_ask = await m.reply_text(
+                    "**Upload to channel/group?**\n"
+                    "Send Channel ID (e.g. `-100xxxxxxxxxx`) or `/d` to upload here.\n"
+                    "_20s timeout → upload here:_"
+                )
+                try:
+                    chan_msg: Message = await bot_client.listen(m.chat.id, timeout=20)
+                    raw_chan = chan_msg.text.strip() if chan_msg.text else "/d"
+                    await chan_msg.delete()
+                    await chan_ask.delete()
+                except asyncio.TimeoutError:
+                    raw_chan = "/d"
+                    await chan_ask.delete()
+                channel_id = (m.chat.id if "/d" in raw_chan
+                              else (int(raw_chan) if raw_chan.lstrip("-").isdigit() else m.chat.id))
+
+                # ── Phase 1: all lectures (video + PDF + quiz) ─────────────
+                await bot_client.send_message(
+                    channel_id,
+                    f"<blockquote><b>📦 Phase 1/2 — Lectures\nBatch: {cname}</b></blockquote>"
+                )
+                await m.reply_text(f"🚀 Starting download of **{len(all_lectures)}** lectures…")
 
                 lec_success, lec_failed = await run_lecture_loop(
                     bot_client=bot_client,
@@ -2321,7 +2387,7 @@ async def appx_main_flow(bot_client: Client, m: Message, user_id_tg: int):
                         bot_client, m, session, api_base,
                         appx_user_id, cid, hdr, course_dir,
                         channel_id=channel_id, cname=cname,
-                        auto_all=True,   # ← skip all pick prompts
+                        auto_all=True,
                         session_credit=session_credit
                     )
 
@@ -2341,6 +2407,52 @@ async def appx_main_flow(bot_client: Client, m: Message, user_id_tg: int):
             want_pdf   = dl_choice in ("2", "3")
             want_quiz  = dl_choice in ("3", "4")
 
+            # Collect lectures (with subject/topic prompts)
+            lec_status = await m.reply_text("⏳ Fetching content…")
+            lectures = await collect_all_lectures(
+                bot_client, m, session, api_base, cid, hdr)
+            await lec_status.delete()
+
+            if not lectures:
+                await m.reply_text("❌ No lectures found.")
+                continue
+
+            await m.reply_text(f"✅ Found **{len(lectures)}** lectures")
+
+            # ── Show lecture list then ask Start from ─────────────────────
+            # Build a numbered list (split into chunks of 50 to avoid Telegram's 4096-char limit)
+            lec_lines = []
+            for idx, lec in enumerate(lectures, start=1):
+                t = lec.get("Title") or f"Lecture_{lec.get('id','?')}"
+                lec_lines.append(f"`{str(idx).zfill(3)})` {t[:60]}")
+
+            chunk_size = 50
+            for chunk_start in range(0, len(lec_lines), chunk_size):
+                chunk = lec_lines[chunk_start:chunk_start + chunk_size]
+                chunk_num = chunk_start // chunk_size + 1
+                total_chunks = (len(lec_lines) + chunk_size - 1) // chunk_size
+                header = (
+                    f"📋 **Lecture List** (Part {chunk_num}/{total_chunks})\n"
+                    f"{'─'*20}\n"
+                ) if total_chunks > 1 else "📋 **Lecture List**\n─────────────────────\n"
+                await m.reply_text(header + "\n".join(chunk))
+
+            start_ask = await m.reply_text(
+                f"**Start from lecture number?** [1–{len(lectures)}, default 1]\n_20s timeout:_"
+            )
+            try:
+                start_msg: Message = await bot_client.listen(m.chat.id, timeout=20)
+                start_raw = start_msg.text.strip() if start_msg.text else "1"
+                await start_msg.delete()
+                await start_ask.delete()
+            except asyncio.TimeoutError:
+                start_raw = "1"
+                await start_ask.delete()
+
+            start_idx = (int(start_raw) - 1) if start_raw.isdigit() else 0
+            lectures  = lectures[start_idx:]
+
+            # ── Quality ───────────────────────────────────────────────────
             prefer_quality = "720p"
             if want_video:
                 q_ask = await m.reply_text(
@@ -2358,32 +2470,54 @@ async def appx_main_flow(bot_client: Client, m: Message, user_id_tg: int):
                 except asyncio.TimeoutError:
                     await q_ask.delete()
 
-            # Collect lectures (with subject/topic prompts)
-            lec_status = await m.reply_text("⏳ Fetching content…")
-            lectures = await collect_all_lectures(
-                bot_client, m, session, api_base, cid, hdr)
-            await lec_status.delete()
-
-            if not lectures:
-                await m.reply_text("❌ No lectures found.")
-                continue
-
-            await m.reply_text(f"✅ Found **{len(lectures)}** lectures")
-
-            start_ask = await m.reply_text(
-                f"**Start from lecture number?** [1-{len(lectures)}, default 1]\n_20s timeout:_"
+            # ── Brand name ────────────────────────────────────────────────
+            brand_ask = await m.reply_text(
+                "**🏷️ Brand name for captions & HTML watermark?**\n"
+                "Send your brand/channel name (e.g. `@MyChannel`) or `/d` to use default.\n"
+                "_20s timeout → default:_"
             )
             try:
-                start_msg: Message = await bot_client.listen(m.chat.id, timeout=20)
-                start_raw = start_msg.text.strip() if start_msg.text else "1"
-                await start_msg.delete()
-                await start_ask.delete()
+                brand_msg: Message = await bot_client.listen(m.chat.id, timeout=20)
+                raw_brand = brand_msg.text.strip() if brand_msg.text else "/d"
+                await brand_msg.delete()
+                await brand_ask.delete()
             except asyncio.TimeoutError:
-                start_raw = "1"
-                await start_ask.delete()
+                raw_brand = "/d"
+                await brand_ask.delete()
+            session_credit = CREDIT if raw_brand == "/d" else raw_brand
+            user_brand_name[user_id_tg] = session_credit
 
-            start_idx = (int(start_raw) - 1) if start_raw.isdigit() else 0
-            lectures  = lectures[start_idx:]
+            # ── Watermark ─────────────────────────────────────────────────
+            wm_ask = await m.reply_text(
+                "**🖊️ Add watermark text?**\n"
+                "Send text (e.g. `@YourChannel`) or `/d` to skip.\n_20s timeout:_"
+            )
+            try:
+                wm_msg: Message = await bot_client.listen(m.chat.id, timeout=20)
+                raw_wm = wm_msg.text.strip() if wm_msg.text else "/d"
+                await wm_msg.delete()
+                await wm_ask.delete()
+            except asyncio.TimeoutError:
+                raw_wm = "/d"
+                await wm_ask.delete()
+            batch_watermark = None if raw_wm == "/d" else raw_wm
+
+            # ── Destination ───────────────────────────────────────────────
+            chan_ask = await m.reply_text(
+                "**Upload to channel/group?**\n"
+                "Send Channel ID (e.g. `-100xxxxxxxxxx`) or `/d` to upload here.\n"
+                "_20s timeout → upload here:_"
+            )
+            try:
+                chan_msg: Message = await bot_client.listen(m.chat.id, timeout=20)
+                raw_chan = chan_msg.text.strip() if chan_msg.text else "/d"
+                await chan_msg.delete()
+                await chan_ask.delete()
+            except asyncio.TimeoutError:
+                raw_chan = "/d"
+                await chan_ask.delete()
+            channel_id = (m.chat.id if "/d" in raw_chan
+                          else (int(raw_chan) if raw_chan.lstrip("-").isdigit() else m.chat.id))
 
             success, failed = await run_lecture_loop(
                 bot_client=bot_client,
