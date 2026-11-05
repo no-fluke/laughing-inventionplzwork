@@ -1,15 +1,11 @@
 """
 ╔══════════════════════════════════════════════════════╗
 ║         AppX / Parmar Academy Downloader             ║
-║           Telegram Bot Edition — v1.3                ║
+║           Telegram Bot Edition — v1.2                ║
 ║   Fixes applied:                                     ║
 ║     1. Multi-PDF per lecture (class_pdfs[1:] skip)  ║
 ║     2. MP4 URL freshness check + 1MB chunk aiohttp  ║
 ║     3. Option 6 — Download EVERYTHING in one shot   ║
-║   New in v1.3:                                       ║
-║     4. Custom brand name in all captions             ║
-║     5. HTML quiz output using quiz_template.html     ║
-║     6. Hindi + English explanation in quizzes        ║
 ╚══════════════════════════════════════════════════════╝
 
 COMMANDS:
@@ -123,55 +119,6 @@ def proxy_mp4_url(url: str) -> str:
         return url
     return PROXY_BASE + urllib.parse.quote(url, safe="")
 
-
-# ══════════════════════════════════════════════════════
-#  BRAND NAME  (v1.4 — per-user dict, keyed by Telegram user_id)
-# ══════════════════════════════════════════════════════
-# Each user gets their own brand name; no cross-user leakage.
-_BRAND_NAMES: dict[int, str] = {}   # user_id_tg -> brand name
-_DEFAULT_BRAND: str = "YourChannel"
-
-def get_brand(user_id: int) -> str:
-    return _BRAND_NAMES.get(user_id, _DEFAULT_BRAND)
-
-def set_brand(user_id: int, name: str) -> None:
-    _BRAND_NAMES[user_id] = name
-
-
-# ══════════════════════════════════════════════════════
-#  QUIZ HTML TEMPLATE LOADER  (v1.3)
-#  Loads quiz_template.html from the same directory as main.py.
-#  Expects sentinels: ___QUIZ_NAME___  ___SECONDS___  ___QUESTIONS___
-#  (the original {quiz_name} / {seconds} / {questions_array} are auto-
-#   converted on load so both old and new template files work).
-# ══════════════════════════════════════════════════════
-_TEMPLATE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "quiz_template.html")
-
-def _load_quiz_template() -> str:
-    """
-    Load quiz_template.html sitting next to main.py.
-    Falls back to a bare-bones inline template if the file is missing.
-    """
-    try:
-        with open(_TEMPLATE_PATH, encoding="utf-8") as _f:
-            t = _f.read()
-        # Support both original {placeholder} style and sentinel style
-        t = t.replace("{quiz_name}", "___QUIZ_NAME___")
-        t = t.replace("{seconds}", "___SECONDS___")
-        t = t.replace("{questions_array}", "___QUESTIONS___")
-        return t
-    except FileNotFoundError:
-        print(f"[QuizHTML] WARNING: quiz_template.html not found at {_TEMPLATE_PATH}. Using minimal fallback.")
-        return (
-            "<!DOCTYPE html><html><head><meta charset='utf-8'>"
-            "<title>___QUIZ_NAME___</title></head><body>"
-            "<h2>___QUIZ_NAME___</h2><pre id='q'></pre><script>"
-            "const Q=___QUESTIONS___;const T=___SECONDS___;"
-            "document.getElementById('q').textContent=JSON.stringify(Q,null,2);"
-            "</script></body></html>"
-        )
-
-
 # ══════════════════════════════════════════════════════
 #  BOT INIT
 # ══════════════════════════════════════════════════════
@@ -185,6 +132,7 @@ bot = Client(
 
 processing_request = {}
 cancel_requested   = {}
+user_brand_name    = {}   # per-user session brand name (caption credit)
 
 BUTTONS_CONTACT = InlineKeyboardMarkup([[
     InlineKeyboardButton(text="📞 Contact", url=f"tg://openmessage?user_id={OWNER}")
@@ -335,12 +283,11 @@ def _extract_user_id_from_jwt(token: str) -> str:
 async def appx_login(bot_client: Client, m: Message, api_base: str):
     """Interactive AppX login. Returns (token, user_id, user_name)."""
     ask = await m.reply_text(
-        "🔐 **AppX Login**\n"
-        "━━━━━━━━━━━━━━━━━━━━\n"
-        "Choose your login method:\n\n"
-        "**1️⃣** — Email / Password\n"
-        "**2️⃣** — JWT Token\n\n"
-        "<blockquote>Reply with `1` or `2`</blockquote>"
+        "**🔐 AppX Login**\n\n"
+        "Choose login method:\n"
+        "**1** — Email / Password\n"
+        "**2** — JWT Token\n\n"
+        "Reply with `1` or `2`"
     )
     try:
         choice_msg: Message = await bot_client.listen(m.chat.id, timeout=60)
@@ -352,11 +299,7 @@ async def appx_login(bot_client: Client, m: Message, api_base: str):
         return None, None, None
 
     if choice in ("2", "JWT", "jwt"):
-        tok_ask = await m.reply_text(
-            "🔑 **JWT Token**\n"
-            "━━━━━━━━━━━━━━━━━━━━\n"
-            "<blockquote>Paste your JWT token below.</blockquote>"
-        )
+        tok_ask = await m.reply_text("**Send your JWT Token:**")
         try:
             tok_msg: Message = await bot_client.listen(m.chat.id, timeout=120)
             token = tok_msg.text.strip() if tok_msg.text else ""
@@ -371,10 +314,7 @@ async def appx_login(bot_client: Client, m: Message, api_base: str):
         user_id = _extract_user_id_from_jwt(token)
         if not user_id:
             uid_ask = await m.reply_text(
-                "⚠️ **User ID Not Found**\n"
-                "━━━━━━━━━━━━━━━━━━━━\n"
-                "<blockquote>Could not extract User ID from token.\nPlease send your User ID manually.</blockquote>"
-            )
+                "⚠️ Could not extract User ID from token.\n**Send your User ID manually:**")
             try:
                 uid_msg: Message = await bot_client.listen(m.chat.id, timeout=60)
                 user_id = uid_msg.text.strip() if uid_msg.text else ""
@@ -389,11 +329,7 @@ async def appx_login(bot_client: Client, m: Message, api_base: str):
         return token, user_id, f"User #{user_id}"
 
     # Email/Password login
-    email_ask = await m.reply_text(
-        "📧 **Email / Mobile**\n"
-        "━━━━━━━━━━━━━━━━━━━━\n"
-        "<blockquote>Send your registered email address or mobile number.</blockquote>"
-    )
+    email_ask = await m.reply_text("**📧 Send your Email / Mobile:**")
     try:
         email_msg: Message = await bot_client.listen(m.chat.id, timeout=120)
         email = email_msg.text.strip() if email_msg.text else ""
@@ -403,11 +339,7 @@ async def appx_login(bot_client: Client, m: Message, api_base: str):
         await email_ask.edit_text("⏰ Timed out.")
         return None, None, None
 
-    pass_ask = await m.reply_text(
-        "🔒 **Password**\n"
-        "━━━━━━━━━━━━━━━━━━━━\n"
-        "<blockquote>Send your account password.</blockquote>"
-    )
+    pass_ask = await m.reply_text("**🔒 Send your Password:**")
     try:
         pass_msg: Message = await bot_client.listen(m.chat.id, timeout=120)
         password = pass_msg.text.strip() if pass_msg.text else ""
@@ -518,6 +450,12 @@ _CDN_MIGRATIONS = {
 
 
 def _norm_q(q) -> str:
+    """Normalise API quality labels to the 'Np' form we compare against.
+
+    The AppX / ClassX API sometimes returns quality as a bare integer
+    (720, 480 …) and sometimes already with the 'p' suffix (720p, 480p).
+    All internal comparisons use the 'Np' form, so we normalise here.
+    """
     s = str(q).strip()
     if s.isdigit():
         return s + "p"
@@ -549,7 +487,7 @@ def _is_mp4_url(url: str) -> bool:
         return False
     lower = url.lower()
     path  = lower.split("?")[0]
-    if path.endswith(".pdf"):
+    if path.endswith(".pdf"):          # never treat PDF URLs as mp4
         return False
     if "static-db.appx.co.in" in lower:
         return True
@@ -561,6 +499,10 @@ def _is_mp4_url(url: str) -> bool:
 
 
 def _mp4_headers(url: str) -> dict:
+    """
+    Full headers matching exact HAR capture of working MP4 download.
+    Icy-MetaData + Host + Range are required by Google-Edge-Cache CDN.
+    """
     from urllib.parse import urlparse
     host = urlparse(url).netloc
     base = {
@@ -610,6 +552,7 @@ def _best_download_link(d: dict, prefer_quality: str = "720p") -> str:
 
 
 def decrypt_all_links(d: dict) -> list:
+    quality_rank = {"1080p": 0, "720p": 1, "480p": 2, "360p": 3, "240p": 4, "144p": 5}
     seen: set   = set()
     results: list = []
 
@@ -650,6 +593,8 @@ def decrypt_all_links(d: dict) -> list:
     if dl:
         _add("download_link", dl)
 
+    # Keep insertion order (encrypted_links first, then download_links).
+    # Caller reorders by preference — don't sort here.
     return results
 
 
@@ -676,17 +621,26 @@ def _resolve_pdf_url(pdf_link: str, pdf_key: str) -> str:
 
 
 def _extract_class_pdfs(d: dict) -> list:
+    """
+    Returns list of (suffix, url) for ALL PDFs on a lecture item.
+    Both pdf_link and pdf_link2 are extracted.
+    Falls back to pdf_summary_link / pdf2_summary_link if decryption yields nothing.
+    e.g. [("", url1), ("_2", url2)]
+    """
     pdfs = []
+
     p1 = _resolve_pdf_url(d.get("pdf_link", ""), d.get("pdf_encryption_key", ""))
     if not p1:
-        p1 = d.get("pdf_summary_link", "")
+        p1 = d.get("pdf_summary_link", "")  # direct URL fallback
     if p1:
         pdfs.append(("", p1))
+
     p2 = _resolve_pdf_url(d.get("pdf_link2", ""), d.get("pdf2_encryption_key", ""))
     if not p2:
-        p2 = d.get("pdf2_summary_link", "")
+        p2 = d.get("pdf2_summary_link", "")  # direct URL fallback
     if p2:
         pdfs.append(("_2", p2))
+
     return pdfs
 
 
@@ -739,6 +693,7 @@ async def resolve_video(session, api_base, course_id, video_id, hdr,
         return (title, d["embed_url"],
                 None, "youtube", class_pdfs, all_candidates)
 
+    # ── Build a quality → url map (video only, no DRM, no PDF) ──────────
     ALL_QUALITIES = ["1080p", "720p", "480p", "360p", "240p", "144p"]
     by_quality: dict = {}
     for qlabel, cand_url in all_candidates:
@@ -746,6 +701,7 @@ async def resolve_video(session, api_base, course_id, video_id, hdr,
             if qlabel not in by_quality:
                 by_quality[qlabel] = cand_url
 
+    # ── Pick primary URL: preferred quality first ────────────────────────
     prefer_order = [prefer_quality] + [q for q in ALL_QUALITIES if q != prefer_quality] + ["file_link", "download_link"]
     chosen_url   = None
     for q in prefer_order:
@@ -758,11 +714,15 @@ async def resolve_video(session, api_base, course_id, video_id, hdr,
     if chosen_url:
         vtype = "mp4" if _is_mp4_url(chosen_url) else "hls"
 
+        # ── Reorder all_candidates: preferred → lower → higher ──────────
+        # For each quality, ALL its URLs (path, backup_url, backup_url2)
+        # are tried before dropping to the next lower quality.
         pref_idx = ALL_QUALITIES.index(prefer_quality) if prefer_quality in ALL_QUALITIES else 1
         lower    = ALL_QUALITIES[pref_idx + 1:]
         higher   = list(reversed(ALL_QUALITIES[:pref_idx]))
         fallback_order = [prefer_quality] + lower + higher + ["file_link", "download_link"]
 
+        # Build a map of quality → ALL its URLs (not just the first one)
         by_quality_all: dict = {}
         for qlabel, cand_url in all_candidates:
             if not _is_drm_url(cand_url):
@@ -777,6 +737,7 @@ async def resolve_video(session, api_base, course_id, video_id, hdr,
                     seen_urls.add(url_q)
                     ordered.append((q, url_q))
 
+        # Append anything not yet covered (unknown quality labels)
         for qlabel, cand_url in all_candidates:
             if cand_url not in seen_urls and not _is_drm_url(cand_url):
                 seen_urls.add(cand_url)
@@ -809,7 +770,7 @@ async def resolve_video(session, api_base, course_id, video_id, hdr,
     return title, None, None, None, [], all_candidates
 
 # ══════════════════════════════════════════════════════
-#  QUIZ / TEST SERIES  (v1.3 — HTML output)
+#  QUIZ / TEST SERIES
 # ══════════════════════════════════════════════════════
 
 async def fetch_quiz(session, api_base, quiz_title_id: str,
@@ -848,127 +809,70 @@ def _strip_html(raw: str) -> str:
     return re.sub(r'\s+', ' ', text).strip()
 
 
-def _build_quiz_question_js(questions: list) -> list:
-    """
-    Convert raw API question dicts into the JS object shape the HTML
-    template expects. Adds Hindi explanation alongside English.
-    """
-    opt_labels = ["A", "B", "C", "D", "E"]
-    result = []
-    for idx, q in enumerate(questions, 1):
-        # ── Question text (EN + optional HI) ────────────────────────
-        q_en = _strip_html(
-            q.get("question") or q.get("question_en")
-            or q.get("que") or q.get("title") or ""
-        )
-        q_hi = _strip_html(q.get("question_hi") or q.get("question_hindi") or "")
-
-        if q_hi:
-            question_html = (
-                f"{q_en}"
-                f"<br><small style=\"color:var(--muted);font-size:0.88em;\">{q_hi}</small>"
-            )
-        else:
-            question_html = q_en
-
-        # ── Options ──────────────────────────────────────────────────
-        opts = {}
-        for num in range(1, 6):
-            raw = q.get(f"option_{num}", "")
-            if not raw:
-                raw_list = q.get("options") or q.get("option") or []
-                if isinstance(raw_list, list) and num - 1 < len(raw_list):
-                    item = raw_list[num - 1]
-                    raw = (item.get("text") or item.get("option") or ""
-                           if isinstance(item, dict) else str(item))
-            clean = _strip_html(raw)
-            if clean:
-                opts[f"option_{num}"] = clean
-
-        # ── Correct answer (normalize letter → number) ────────────────
-        answer_raw = str(
-            q.get("answer") or q.get("correct_answer")
-            or q.get("correct_option") or q.get("correct") or "1"
-        ).strip()
-        letter_map = {"A": "1", "B": "2", "C": "3", "D": "4", "E": "5"}
-        if answer_raw.upper() in letter_map:
-            answer_raw = letter_map[answer_raw.upper()]
-
-        # ── Scoring ──────────────────────────────────────────────────
-        correct_score  = q.get("correct_score", 1) or 1
-        negative_score = q.get("negative_score", 0) or 0
-
-        # ── Explanation (English + Hindi side by side) ────────────────
-        exp_en = _strip_html(
-            q.get("solution_text") or q.get("explanation")
-            or q.get("solution") or ""
-        )
-        exp_hi = _strip_html(
-            q.get("solution_text_hi") or q.get("explanation_hi")
-            or q.get("solution_hindi") or q.get("explanation_hindi") or ""
-        )
-        if exp_en and exp_hi:
-            solution_html = (
-                f"<strong>🇬🇧 English:</strong> {exp_en}"
-                f"<br><br><strong style=\"color:var(--accent-dark);\">🇮🇳 Hindi / हिंदी:</strong> {exp_hi}"
-            )
-        elif exp_en:
-            solution_html = exp_en
-        elif exp_hi:
-            solution_html = exp_hi
-        else:
-            solution_html = ""
-
-        entry = {
-            "id": idx,
-            "question": question_html,
-            "answer": answer_raw,
-            "correct_score": correct_score,
-            "negative_score": negative_score,
-            "solution_text": solution_html,
-            **opts,
-        }
-        result.append(entry)
-    return result
-
-
-def save_quiz_html(questions: list, out_path: str, title: str,
-                   brand_name: str = "") -> str | None:
-    """
-    Render questions into the HTML quiz template and save as .html file.
-    Places the file at <out_path>_quiz.html.
-    Returns the saved path, or None on failure.
-    """
+def save_quiz_txt(questions: list, out_path: str, title: str):
     if not questions:
         return None
-    out = f"{out_path}_quiz.html"
+    out = f"{out_path}_quiz.txt"
     try:
-        js_questions   = _build_quiz_question_js(questions)
-        questions_json = json.dumps(js_questions, ensure_ascii=False, indent=2)
-
-        # Auto-calculate timer: 1.5 min per question, clamped 5–180 min
-        seconds = max(300, min(len(questions) * 90, 10800))
-
-        template = _load_quiz_template()
-
-        # Swap watermark text to brand name
-        wm = brand_name.strip() if brand_name else "RANKUP"
-        template = template.replace("RANKUP", wm)
-
-        # Inject values via sentinels
-        html = (template
-                .replace("___QUIZ_NAME___", title)
-                .replace("___SECONDS___", str(seconds))
-                .replace("___QUESTIONS___", questions_json))
-
         with open(out, "w", encoding="utf-8") as f:
-            f.write(html)
-
-        if os.path.exists(out) and os.path.getsize(out) > 512:
-            return out
+            f.write(f"Quiz: {title}\n")
+            f.write("═" * 60 + "\n\n")
+            opt_labels = ["A", "B", "C", "D", "E"]
+            for idx, q in enumerate(questions, 1):
+                q_text = _strip_html(
+                    q.get("question") or q.get("question_en")
+                    or q.get("que")   or q.get("title") or ""
+                )
+                f.write(f"Q{idx}. {q_text}\n")
+                options = []
+                for num in range(1, 6):
+                    raw_opt = q.get(f"option_{num}", "")
+                    clean   = _strip_html(raw_opt)
+                    if clean:
+                        label = opt_labels[num - 1] if num - 1 < len(opt_labels) else str(num)
+                        options.append((label, clean))
+                if not options:
+                    raw_list = q.get("options") or q.get("option") or []
+                    if isinstance(raw_list, list):
+                        for oi, opt in enumerate(raw_list):
+                            t = _strip_html(opt.get("text") or opt.get("option") or "" if isinstance(opt, dict) else str(opt))
+                            if t:
+                                label = opt_labels[oi] if oi < len(opt_labels) else str(oi + 1)
+                                options.append((label, t))
+                answer_raw = str(
+                    q.get("answer") or q.get("correct_answer")
+                    or q.get("correct_option") or q.get("correct") or ""
+                ).strip()
+                correct_label = ""
+                correct_text  = ""
+                try:
+                    ans_idx = int(answer_raw) - 1
+                    if 0 <= ans_idx < len(options):
+                        correct_label, correct_text = options[ans_idx]
+                except (ValueError, TypeError):
+                    for lbl, txt in options:
+                        if lbl == answer_raw.upper():
+                            correct_label, correct_text = lbl, txt
+                            break
+                for lbl, txt in options:
+                    marker = " ✓" if lbl == correct_label else ""
+                    f.write(f"   {lbl}) {txt}{marker}\n")
+                if correct_text:
+                    f.write(f"\n   ✓ Answer: {correct_label}) {correct_text}\n")
+                elif answer_raw:
+                    f.write(f"\n   ✓ Answer: Option {answer_raw}\n")
+                exp = _strip_html(q.get("solution_text") or q.get("explanation") or q.get("solution") or "")
+                if exp:
+                    f.write(f"   💡 {exp}\n")
+                cs = q.get("correct_score", "")
+                ns = q.get("negative_score", "")
+                if cs or ns:
+                    f.write(f"   [+{cs} / -{ns}]\n")
+                f.write("\n")
+        return out
     except Exception as e:
-        print(f"[Quiz-HTML] save error: {e}")
-    return None
+        print(f"[Quiz] save error: {e}")
+        return None
 
 
 async def get_test_series_list(session, api_base, user_id, course_id, hdr) -> list:
@@ -1059,10 +963,15 @@ def safe_filename(name: str, idx: int = None) -> str:
     return prefix + name
 
 # ══════════════════════════════════════════════════════
-#  MP4 URL FRESHNESS CHECK
+#  FIX 2 — MP4 URL FRESHNESS CHECK
 # ══════════════════════════════════════════════════════
 
 async def _check_url_fresh(url: str, headers: dict, timeout: int = 8) -> bool:
+    """
+    HEAD request to verify a signed CDN URL is still alive before
+    committing a slow downloader. Returns False immediately on 403/404
+    so we don't waste time on all 5 download methods for a dead URL.
+    """
     try:
         connector = aiohttp.TCPConnector(ssl=False)
         async with aiohttp.ClientSession(connector=connector) as s:
@@ -1073,6 +982,7 @@ async def _check_url_fresh(url: str, headers: dict, timeout: int = 8) -> bool:
                 if resp.status in (200, 206):
                     return True
                 if resp.status == 405:
+                    # HEAD not supported — zero-byte GET
                     async with s.get(
                         url, headers=headers, allow_redirects=True,
                         timeout=aiohttp.ClientTimeout(total=timeout)
@@ -1209,6 +1119,7 @@ async def ytdlp_download(url: str, out_path: str,
     is_proxy = url.startswith(PROXY_BASE)
 
     if _ARIA2C and not is_proxy:
+        # aria2c uses parallel range requests — incompatible with proxy
         ret = await _run(*base_args,
             "--external-downloader", "aria2c",
             "--downloader-args", "aria2c:-x 16 -j 32 -k 1M",
@@ -1252,6 +1163,8 @@ async def download_pdf(url: str, out_path: str):
         async with aiohttp.ClientSession(connector=connector) as session:
             async with session.get(url, headers=PDF_HEADERS,
                                    timeout=aiohttp.ClientTimeout(total=120)) as resp:
+                # Accept any successful response — CDN may return video/mp4
+                # or application/octet-stream as content-type for PDFs
                 if resp.status in (200, 206):
                     data = await resp.read()
                     if len(data) > 512:
@@ -1275,12 +1188,15 @@ async def download_pdf(url: str, out_path: str):
 
 async def direct_stream_download(url: str, out_path: str):
     """
-    aiohttp with 1 MB chunks. Detects expired URLs via 404 mid-stream.
+    FIX 2: aiohttp with 1 MB chunks (up from 64 KB) and a truncation
+    check. Detects expired URLs via 404 mid-stream and returns None
+    immediately rather than saving a corrupt partial file.
     """
     mp4_hdrs = _mp4_headers(url)
     out      = f"{out_path}.mp4"
 
     try:
+        # Proxy streams full file without range support — need a long sock_read
         sock_read = 1800 if url.startswith(PROXY_BASE) else 90
         connector = aiohttp.TCPConnector(ssl=False, limit=4, keepalive_timeout=60)
         async with aiohttp.ClientSession(connector=connector) as dl_sess:
@@ -1302,6 +1218,7 @@ async def direct_stream_download(url: str, out_path: str):
                 start_t    = time.time()
 
                 async with aiofiles.open(out, "wb") as f:
+                    # 1 MB chunks — fills TCP window properly on fast CDN
                     async for chunk in resp.content.iter_chunked(1048576):
                         await f.write(chunk)
                         downloaded += len(chunk)
@@ -1319,6 +1236,7 @@ async def direct_stream_download(url: str, out_path: str):
                             last_log = now
                 print()
 
+                # Truncation check — discard if we got less than 98% of expected
                 actual = os.path.getsize(out) if os.path.exists(out) else 0
                 if expected and actual < expected * 0.98:
                     print(f"[Direct] Truncated ({actual/(1024*1024):.1f} MB "
@@ -1334,6 +1252,7 @@ async def direct_stream_download(url: str, out_path: str):
         try: os.remove(out)
         except Exception: pass
 
+    # yt-dlp fallback WITH correct headers
     if _YTDLP:
         res = await ytdlp_download(url, out_path, extra_headers=mp4_hdrs)
         if res:
@@ -1353,14 +1272,17 @@ async def _download_single_url(url: str, vtype: str, xor_key: str,
     }
 
     if _is_mp4_url(url) or url.lower().split("?")[0].endswith(".mp4"):
+        # Always route mp4 URLs through proxy
         proxied    = proxy_mp4_url(url)
         proxy_hdrs = {"User-Agent": MEDIA_UA, "Referer": MEDIA_REFERER}
         print(f"[MP4] Routing through proxy…")
 
+        # Method 1: aiohttp via proxy
         result = await direct_stream_download(proxied, out_path)
         if result:
             return result
 
+        # Method 2: yt-dlp via proxy
         result = await ytdlp_download(proxied, out_path, extra_headers=proxy_hdrs)
         if result:
             return result
@@ -1435,6 +1357,7 @@ async def download_item(title: str, url: str, xor_key: str, vtype: str,
         size = os.path.getsize(result) / (1024 * 1024)
         print(f"[Download] ✓ Saved: {os.path.basename(result)} ({size:.1f} MB)")
 
+    # FIX 1 — download ALL class PDFs, not just the first one
     if want_pdf and class_pdfs:
         for suffix, pdf_url in class_pdfs:
             if not pdf_url:
@@ -1565,7 +1488,7 @@ async def collect_all_lectures(bot_client: Client, m: Message,
     return lectures
 
 # ══════════════════════════════════════════════════════
-#  TEST SERIES FLOW  (v1.3 — HTML quiz output)
+#  TEST SERIES FLOW
 # ══════════════════════════════════════════════════════
 
 async def download_test_series(bot_client: Client, m: Message,
@@ -1573,12 +1496,11 @@ async def download_test_series(bot_client: Client, m: Message,
                                course_dir: str,
                                channel_id: int = None,
                                cname: str = "",
-                               auto_all: bool = False,
-                               brand_name: str = ""):
+                               auto_all: bool = False):
     """
-    Download test series as HTML quiz files.
-    auto_all=True skips pick prompts (used by Download Everything — option 6).
-    brand_name is embedded in quiz watermarks and caption.
+    Download test series.  auto_all=True skips the pick prompts and
+    downloads every series / subject / test automatically (used by
+    the Download Everything flow — option 6).
     """
     channel_id = channel_id or m.chat.id
     status = await m.reply_text("⏳ Fetching test series list…")
@@ -1697,20 +1619,12 @@ async def download_test_series(bot_client: Client, m: Message,
                 await asyncio.sleep(0.5)
                 continue
 
-            # ── v1.3: save as HTML instead of .txt ───────────────────
-            qfile = save_quiz_html(questions, out_path, tname, brand_name=brand_name)
+            qfile = save_quiz_txt(questions, out_path, tname)
             if qfile:
-                caption = (
-                    f"📝 **{tname[:55]}**\n"
-                    f"┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
-                    f"❓ `{len(questions)} Questions`\n"
-                    f"<blockquote>📂 {cname}</blockquote>\n"
-                    f"✦ **{brand_name or CREDIT}**"
-                )
                 await bot_client.send_document(
                     channel_id,
                     document=qfile,
-                    caption=caption
+                    caption=f"📝 `{os.path.basename(qfile)}`\n`{len(questions)} questions`"
                 )
                 os.remove(qfile)
                 success += 1
@@ -1725,7 +1639,7 @@ async def download_test_series(bot_client: Client, m: Message,
         )
 
 # ══════════════════════════════════════════════════════
-#  LECTURE DOWNLOAD LOOP  (v1.3 — HTML quiz + brand captions)
+#  LECTURE DOWNLOAD LOOP  (shared by options 1-4 and 6)
 # ══════════════════════════════════════════════════════
 
 async def run_lecture_loop(
@@ -1743,21 +1657,18 @@ async def run_lecture_loop(
     want_quiz: bool,
     prefer_quality: str,
     batch_watermark,
+    session_credit: str,
     lectures: list,
     start_idx: int,
     downloads_dir: str,
-    brand_name: str = "",
 ):
     """
-    Inner loop that downloads lectures.
-    brand_name is included in all captions and quiz watermarks.
+    The inner loop that downloads lectures.  Extracted so both the
+    single-mode flow and the Download-Everything flow can share it.
     Returns (success, failed) counts.
     """
     success = failed = 0
     total   = len(lectures)
-
-    # Brand tag shown in captions
-    brand_tag = brand_name or CREDIT
 
     prog_msg = await bot_client.send_message(
         channel_id,
@@ -1793,23 +1704,7 @@ async def run_lecture_loop(
         name     = safe_filename(title, i)
         out_path = os.path.join(downloads_dir, name)
 
-        # ── v1.3 captions include brand name ─────────────────────────
-        cc  = (
-            f"🎬 **{title[:55]}**\n"
-            f"┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
-            f"📦 `#{str(i).zfill(3)}`  •  🎞 `{prefer_quality}`\n"
-            f"<blockquote>📂 {cname}</blockquote>\n"
-            f"✦ **{brand_tag}**"
-        )
-        cc1 = (
-            f"📄 **{title[:55]}**\n"
-            f"┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
-            f"📦 `#{str(i).zfill(3)}`  •  📕 `PDF`\n"
-            f"<blockquote>📂 {cname}</blockquote>\n"
-            f"✦ **{brand_tag}**"
-        )
-
-        # ── Quiz detection ────────────────────────────────────────────
+        # ── Quiz detection ──────────────────────────────────────────
         QUIZ_TYPES = {"QUIZ", "TEST", "ATTEMPT", "EXERCISE", "ASSIGNMENT"}
         _raw_qid   = str(lec.get("quiz_title_id") or lec.get("quiz_id") or "")
         _has_quiz  = (
@@ -1822,18 +1717,15 @@ async def run_lecture_loop(
             if want_quiz and quiz_id:
                 questions = await fetch_quiz(session, api_base, quiz_id, appx_user_id, hdr)
                 if questions:
-                    # ── v1.3: HTML output ─────────────────────────────
-                    qfile = save_quiz_html(questions, out_path, title, brand_name=brand_tag)
+                    qfile = save_quiz_txt(questions, out_path, title)
                     if qfile:
                         await bot_client.send_document(
                             channel_id,
                             document=qfile,
                             caption=(
-                                f"📝 **{title[:55]}**\n"
-                                f"┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
-                                f"❓ `{len(questions)} Questions`  •  📦 `#{i}/{total}`\n"
-                                f"<blockquote>📂 {cname}</blockquote>\n"
-                                f"✦ **{brand_tag}**"
+                                f"📝 `{title[:60]}`\n"
+                                f"`{len(questions)} questions`\n"
+                                f"`{i}/{total}` | Batch: {cname}"
                             )
                         )
                         os.remove(qfile)
@@ -1847,7 +1739,7 @@ async def run_lecture_loop(
                     "quiz" in mat.lower() and mat.upper() != "VIDEO"):
                 continue
 
-        # ── Resolve URL ───────────────────────────────────────────────
+        # ── Resolve URL ─────────────────────────────────────────────
         vtitle, url, xor_key, vtype, class_pdfs, all_candidates = \
             await resolve_video(
                 session, api_base, cid, lec_id, hdr,
@@ -1857,8 +1749,20 @@ async def run_lecture_loop(
             failed += 1
             continue
 
-        # ── PDF-type items ────────────────────────────────────────────
+        cc  = (
+            f"[🎥] `{str(i).zfill(3)}) {title[:60]} [{prefer_quality}]`\n"
+            f"<blockquote>Batch: {cname}</blockquote>\n"
+            f"Extracted by ➤ {session_credit}"
+        )
+        cc1 = (
+            f"[📕] `{str(i).zfill(3)}) {title[:60]}.pdf`\n"
+            f"<blockquote>Batch: {cname}</blockquote>\n"
+            f"Extracted by ➤ {session_credit}"
+        )
+
+        # ── FIX 1: handle PDF-type items with ALL attached PDFs ─────
         if vtype == "pdf" and want_pdf:
+            # url is class_pdfs[0] when vtype=="pdf" — download it directly
             pr = await download_pdf(url, out_path)
             if pr:
                 await bot_client.send_document(channel_id, document=pr, caption=cc1)
@@ -1867,17 +1771,17 @@ async def run_lecture_loop(
             else:
                 failed += 1
 
+            # Extra PDFs (class_pdfs[1:]) — primary was already the first entry
+            # so we skip index 0 to avoid re-downloading it.
             for idx2, (suffix, purl) in enumerate(class_pdfs, start=2):
                 if not purl:
                     continue
                 pr2 = await download_pdf(purl, f"{out_path}_extra_{idx2}")
                 if pr2:
                     cc_extra = (
-                        f"📄 **{title[:50]} (Part {idx2})**\n"
-                        f"┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
-                        f"📦 `#{str(i).zfill(3)}`  •  📕 `PDF`\n"
-                        f"<blockquote>📂 {cname}</blockquote>\n"
-                        f"✦ **{brand_tag}**"
+                        f"[📕] `{str(i).zfill(3)}) {title[:55]}_p{idx2}.pdf`\n"
+                        f"<blockquote>Batch: {cname}</blockquote>\n"
+                        f"Extracted by ➤ {session_credit}"
                     )
                     await bot_client.send_document(channel_id, document=pr2, caption=cc_extra)
                     os.remove(pr2)
@@ -1887,6 +1791,7 @@ async def run_lecture_loop(
             continue
 
         if vtype not in ("pdf",) and not want_video:
+            # Still send class PDFs even when skipping video
             if want_pdf and class_pdfs:
                 for suffix, purl in class_pdfs:
                     if not purl:
@@ -1897,7 +1802,7 @@ async def run_lecture_loop(
                         os.remove(pr)
             continue
 
-        # ── YouTube ───────────────────────────────────────────────────
+        # ── YouTube ─────────────────────────────────────────────────
         if vtype == "youtube":
             ytf = f"bv*[height<={prefer_quality[:-1]}][ext=mp4]+ba[ext=m4a]/b[height<=?{prefer_quality[:-1]}]"
             cmd = (
@@ -1919,7 +1824,7 @@ async def run_lecture_loop(
             await asyncio.sleep(1)
             continue
 
-        # ── Regular video (HLS / MP4 / encrypted) ────────────────────
+        # ── Regular video (HLS / MP4 / encrypted) ───────────────────
         if 'encrypted.m' in (url or ""):
             appxkey  = url.split('*')[1]
             url      = url.split('*')[0]
@@ -1950,6 +1855,7 @@ async def run_lecture_loop(
             await helper.send_vid(
                 bot_client, m, cc, res_file, "/d", name,
                 prog_msg, channel_id, watermark_text=batch_watermark)
+            # FIX 1: also send class PDFs attached to this video lecture
             if want_pdf and class_pdfs:
                 for suffix, purl in class_pdfs:
                     if not purl:
@@ -1985,93 +1891,17 @@ async def run_lecture_loop(
     return success, failed
 
 # ══════════════════════════════════════════════════════
-#  HELPER — ask quality + watermark
-# ══════════════════════════════════════════════════════
-
-async def _ask_quality_and_watermark(bot_client: Client, m: Message,
-                                     want_video: bool):
-    prefer_quality = "720p"
-    if want_video:
-        q_ask = await m.reply_text(
-            "🎬 **Video Quality**\n"
-            "━━━━━━━━━━━━━━━━━━━━\n"
-            "`1` — 1080p\n"
-            "`2` — 720p _(default)_\n"
-            "`3` — 480p\n"
-            "`4` — 360p\n"
-            "`5` — 240p\n"
-            "<blockquote>_⏳ 20s timeout → 720p_</blockquote>"
-        )
-        try:
-            q_msg: Message = await bot_client.listen(m.chat.id, timeout=20)
-            q_map = {"1": "1080p", "2": "720p", "3": "480p",
-                     "4": "360p",  "5": "240p"}
-            prefer_quality = q_map.get(
-                q_msg.text.strip() if q_msg.text else "2", "720p")
-            await q_msg.delete()
-            await q_ask.delete()
-        except asyncio.TimeoutError:
-            await q_ask.delete()
-
-    wm_ask = await m.reply_text(
-        "🖊️ **Video Watermark**\n"
-        "━━━━━━━━━━━━━━━━━━━━\n"
-        "<blockquote>Send watermark text to embed on videos.\n"
-        "Example: `@YourChannel`\n\n"
-        "Send `/d` to skip.\n"
-        "_⏳ 20s timeout → skip_</blockquote>"
-    )
-    try:
-        wm_msg: Message = await bot_client.listen(m.chat.id, timeout=20)
-        raw_wm = wm_msg.text.strip() if wm_msg.text else "/d"
-        await wm_msg.delete()
-        await wm_ask.delete()
-    except asyncio.TimeoutError:
-        raw_wm = "/d"
-        await wm_ask.delete()
-
-    batch_watermark = None if raw_wm == "/d" else raw_wm
-    return prefer_quality, batch_watermark
-
-# ══════════════════════════════════════════════════════
-#  MAIN APPX DOWNLOAD FLOW  (v1.3 — brand name setup)
+#  MAIN APPX DOWNLOAD FLOW
 # ══════════════════════════════════════════════════════
 
 async def appx_main_flow(bot_client: Client, m: Message, user_id_tg: int):
-    # ── Step 0 (v1.4): Brand / Channel name — stored per user ────────────
-    brand_ask = await m.reply_text(
-        "✏️ **Brand / Channel Name**\n"
-        "━━━━━━━━━━━━━━━━━━━━\n"
-        "<blockquote>This name appears in all captions and quiz watermarks.\n\n"
-        "Examples: `@MrBerlin` · `Berlin Academy` · `@YourChannel`\n\n"
-        "Send `/d` to keep default (`YourChannel`)\n"
-        "_⏳ 30s timeout → default_</blockquote>"
-    )
-    try:
-        brand_msg: Message = await bot_client.listen(m.chat.id, timeout=30)
-        brand_raw = brand_msg.text.strip() if brand_msg.text else "/d"
-        await brand_msg.delete()
-        await brand_ask.delete()
-    except asyncio.TimeoutError:
-        brand_raw = "/d"
-        await brand_ask.delete()
-
-    if brand_raw and brand_raw != "/d":
-        set_brand(user_id_tg, brand_raw)
-    # else keep the user's existing / default value
-
-    _BRAND_NAME = get_brand(user_id_tg)   # local alias for the rest of this flow
-    await m.reply_text(f"✅ **Brand name set to:** `{_BRAND_NAME}`")
-
     # ── Step 1: API Domain ────────────────────────────────────────────────
     domain_ask = await m.reply_text(
-        "🌐 **API Domain**\n"
-        "━━━━━━━━━━━━━━━━━━━━\n"
-        "<blockquote>Enter your AppX API domain.\n\n"
-        "Examples:\n"
+        "**🌐 Enter API Domain**\n\n"
+        "<blockquote>Examples:\n"
         "• `parmaracademyapi.teachx.in`\n"
         "• `e1coachingcenterapi.classx.co.in`\n\n"
-        "_Send without_ `https://`</blockquote>"
+        "Send **without** `https://`</blockquote>"
     )
     try:
         domain_msg: Message = await bot_client.listen(m.chat.id, timeout=120)
@@ -2124,17 +1954,16 @@ async def appx_main_flow(bot_client: Client, m: Message, user_id_tg: int):
 
             await m.reply_text(f"**📚 Course: {cname}**")
 
-            # ── Step 4: What to download? ──────────────────────────────────
+            # ── Download type ──────────────────────────────────────────────
             dl_type_ask = await m.reply_text(
-                "📥 **What to Download?**\n"
-                "━━━━━━━━━━━━━━━━━━━━\n"
-                "`1` — 🎬 Videos only\n"
-                "`2` — 📄 PDFs only\n"
-                "`3` — 📦 Everything _(videos + PDFs + quizzes)_\n"
-                "`4` — 📝 Quizzes only\n"
-                "`5` — 🧪 Test Series\n"
-                "`6` — 🔥 Download EVERYTHING\n"
-                "<blockquote>_⏳ 20s timeout → default 3_</blockquote>"
+                "**What to download?**\n\n"
+                "`1` — Videos only\n"
+                "`2` — PDFs only\n"
+                "`3` — Everything (videos + PDFs + quizzes)\n"
+                "`4` — Quizzes only\n"
+                "`5` — Test Series\n"
+                "`6` — 🔥 Download EVERYTHING (videos + PDFs + quizzes + ALL test series)\n\n"
+                "_Send a number (20s timeout → default 3):_"
             )
             try:
                 dl_msg: Message = await bot_client.listen(m.chat.id, timeout=20)
@@ -2145,14 +1974,11 @@ async def appx_main_flow(bot_client: Client, m: Message, user_id_tg: int):
                 dl_choice = "3"
                 await dl_type_ask.delete()
 
-            # ── Step 5: Upload destination ─────────────────────────────────
+            # ── Common: upload destination & watermark (shared by all modes) ─
             chan_ask = await m.reply_text(
-                "📤 **Upload Destination**\n"
-                "━━━━━━━━━━━━━━━━━━━━\n"
-                "<blockquote>Send a Channel / Group ID to upload there.\n"
-                "Example: `-100xxxxxxxxxx`\n\n"
-                "Send `/d` to upload here.\n"
-                "_⏳ 20s timeout → upload here_</blockquote>"
+                "**Upload to channel/group?**\n"
+                "Send Channel ID (e.g. `-100xxxxxxxxxx`) or `/d` to upload here.\n"
+                "_20s timeout → upload here:_"
             )
             try:
                 chan_msg: Message = await bot_client.listen(m.chat.id, timeout=20)
@@ -2166,6 +1992,37 @@ async def appx_main_flow(bot_client: Client, m: Message, user_id_tg: int):
             channel_id = (m.chat.id if "/d" in raw_chan
                           else (int(raw_chan) if raw_chan.lstrip("-").isdigit() else m.chat.id))
 
+            wm_ask = await m.reply_text(
+                "**🖊️ Add watermark text?**\n"
+                "Send text (e.g. `@YourChannel`) or `/d` to skip.\n_20s timeout:_"
+            )
+            try:
+                wm_msg: Message = await bot_client.listen(m.chat.id, timeout=20)
+                raw_wm = wm_msg.text.strip() if wm_msg.text else "/d"
+                await wm_msg.delete()
+                await wm_ask.delete()
+            except asyncio.TimeoutError:
+                raw_wm = "/d"
+                await wm_ask.delete()
+            batch_watermark = None if raw_wm == "/d" else raw_wm
+
+            # ── Per-user brand name for captions ──────────────────────────
+            brand_ask = await m.reply_text(
+                "**🏷️ Brand name for captions?**\n"
+                "Send your brand/channel name (e.g. `@MyChannel`) or `/d` to use default.\n"
+                "_20s timeout → default:_"
+            )
+            try:
+                brand_msg: Message = await bot_client.listen(m.chat.id, timeout=20)
+                raw_brand = brand_msg.text.strip() if brand_msg.text else "/d"
+                await brand_msg.delete()
+                await brand_ask.delete()
+            except asyncio.TimeoutError:
+                raw_brand = "/d"
+                await brand_ask.delete()
+            session_credit = CREDIT if raw_brand == "/d" else raw_brand
+            user_brand_name[user_id_tg] = session_credit
+
             downloads_dir = os.path.join(tempfile.gettempdir(), "downloads")
             os.makedirs(downloads_dir, exist_ok=True)
 
@@ -2178,8 +2035,7 @@ async def appx_main_flow(bot_client: Client, m: Message, user_id_tg: int):
                 await download_test_series(
                     bot_client, m, session, api_base,
                     appx_user_id, cid, hdr, course_dir,
-                    channel_id=channel_id, cname=cname,
-                    brand_name=_BRAND_NAME)
+                    channel_id=channel_id, cname=cname)
                 continue
 
             # ══════════════════════════════════════════════════════
@@ -2191,10 +2047,35 @@ async def appx_main_flow(bot_client: Client, m: Message, user_id_tg: int):
                     "Will download in this order:\n"
                     "1️⃣ All videos + PDFs + lecture quizzes\n"
                     "2️⃣ All test series (every series, every subject, every test)\n\n"
-                    "Collecting all lectures first…"
+                    "No further prompts — starting now…"
+                )
+
+                # Quality for videos
+                q_ask = await m.reply_text(
+                    "**Video quality?**\n"
+                    "`1` 1080p  `2` 720p (default)  `3` 480p\n"
+                    "`4` 360p   `5` 240p\n"
+                    "_Send choice (20s timeout → 720p):_"
+                )
+                try:
+                    q_msg: Message = await bot_client.listen(m.chat.id, timeout=20)
+                    q_map = {"1":"1080p","2":"720p","3":"480p","4":"360p","5":"240p"}
+                    prefer_quality = q_map.get(q_msg.text.strip() if q_msg.text else "2", "720p")
+                    await q_msg.delete()
+                    await q_ask.delete()
+                except asyncio.TimeoutError:
+                    prefer_quality = "720p"
+                    await q_ask.delete()
+
+                # ── Phase 1: all lectures (video + PDF + quiz) ─────────────
+                await bot_client.send_message(
+                    channel_id,
+                    f"<blockquote><b>📦 Phase 1/2 — Lectures\nBatch: {cname}</b></blockquote>"
                 )
 
                 lec_status = await m.reply_text("⏳ Fetching all lectures…")
+                # For option 6 we collect ALL subjects/topics without prompting.
+                # We temporarily monkey-patch _bot_pick to always return all items.
                 all_lectures: list = []
                 folder_data = await get_folder_contents(session, api_base, cid, -1, hdr)
                 if folder_data:
@@ -2215,16 +2096,9 @@ async def appx_main_flow(bot_client: Client, m: Message, user_id_tg: int):
                                 lec["_topic"]   = tn
                             all_lectures.extend(lecs)
                             await asyncio.sleep(0.2)
+
                 await lec_status.delete()
-                await m.reply_text(f"✅ Found **{len(all_lectures)}** lectures.")
-
-                prefer_quality, batch_watermark = await _ask_quality_and_watermark(
-                    bot_client, m, want_video=True)
-
-                await bot_client.send_message(
-                    channel_id,
-                    f"<blockquote><b>📦 Phase 1/2 — Lectures\nBatch: {cname}</b></blockquote>"
-                )
+                await m.reply_text(f"✅ Found **{len(all_lectures)}** lectures — starting download…")
 
                 lec_success, lec_failed = await run_lecture_loop(
                     bot_client=bot_client,
@@ -2241,10 +2115,10 @@ async def appx_main_flow(bot_client: Client, m: Message, user_id_tg: int):
                     want_quiz=True,
                     prefer_quality=prefer_quality,
                     batch_watermark=batch_watermark,
+                    session_credit=session_credit,
                     lectures=all_lectures,
                     start_idx=0,
                     downloads_dir=downloads_dir,
-                    brand_name=_BRAND_NAME,
                 )
 
                 await bot_client.send_message(
@@ -2253,6 +2127,7 @@ async def appx_main_flow(bot_client: Client, m: Message, user_id_tg: int):
                     f"✓ Success: {lec_success}  ✗ Failed: {lec_failed}</blockquote>"
                 )
 
+                # ── Phase 2: all test series ───────────────────────────────
                 if cancel_requested.get(user_id_tg, False):
                     await m.reply_text("🚦 Stopped before Phase 2 (Test Series).")
                 else:
@@ -2265,8 +2140,7 @@ async def appx_main_flow(bot_client: Client, m: Message, user_id_tg: int):
                         bot_client, m, session, api_base,
                         appx_user_id, cid, hdr, course_dir,
                         channel_id=channel_id, cname=cname,
-                        auto_all=True,
-                        brand_name=_BRAND_NAME,
+                        auto_all=True   # ← skip all pick prompts
                     )
 
                 await bot_client.send_message(
@@ -2285,6 +2159,24 @@ async def appx_main_flow(bot_client: Client, m: Message, user_id_tg: int):
             want_pdf   = dl_choice in ("2", "3")
             want_quiz  = dl_choice in ("3", "4")
 
+            prefer_quality = "720p"
+            if want_video:
+                q_ask = await m.reply_text(
+                    "**Video quality?**\n"
+                    "`1` 1080p  `2` 720p (default)  `3` 480p\n"
+                    "`4` 360p   `5` 240p\n"
+                    "_Send choice (20s timeout → 720p):_"
+                )
+                try:
+                    q_msg: Message = await bot_client.listen(m.chat.id, timeout=20)
+                    q_map = {"1":"1080p","2":"720p","3":"480p","4":"360p","5":"240p"}
+                    prefer_quality = q_map.get(q_msg.text.strip() if q_msg.text else "2", "720p")
+                    await q_msg.delete()
+                    await q_ask.delete()
+                except asyncio.TimeoutError:
+                    await q_ask.delete()
+
+            # Collect lectures (with subject/topic prompts)
             lec_status = await m.reply_text("⏳ Fetching content…")
             lectures = await collect_all_lectures(
                 bot_client, m, session, api_base, cid, hdr)
@@ -2297,11 +2189,7 @@ async def appx_main_flow(bot_client: Client, m: Message, user_id_tg: int):
             await m.reply_text(f"✅ Found **{len(lectures)}** lectures")
 
             start_ask = await m.reply_text(
-                f"▶️ **Start From Lecture**\n"
-                f"━━━━━━━━━━━━━━━━━━━━\n"
-                f"<blockquote>Enter lecture number to start from.\n"
-                f"Range: `1` – `{len(lectures)}` _(default: 1)_\n"
-                f"_⏳ 20s timeout → start from 1_</blockquote>"
+                f"**Start from lecture number?** [1-{len(lectures)}, default 1]\n_20s timeout:_"
             )
             try:
                 start_msg: Message = await bot_client.listen(m.chat.id, timeout=20)
@@ -2314,9 +2202,6 @@ async def appx_main_flow(bot_client: Client, m: Message, user_id_tg: int):
 
             start_idx = (int(start_raw) - 1) if start_raw.isdigit() else 0
             lectures  = lectures[start_idx:]
-
-            prefer_quality, batch_watermark = await _ask_quality_and_watermark(
-                bot_client, m, want_video=want_video)
 
             success, failed = await run_lecture_loop(
                 bot_client=bot_client,
@@ -2333,10 +2218,10 @@ async def appx_main_flow(bot_client: Client, m: Message, user_id_tg: int):
                 want_quiz=want_quiz,
                 prefer_quality=prefer_quality,
                 batch_watermark=batch_watermark,
+                session_credit=session_credit,
                 lectures=lectures,
                 start_idx=start_idx,
                 downloads_dir=downloads_dir,
-                brand_name=_BRAND_NAME,
             )
 
             await bot_client.send_message(
