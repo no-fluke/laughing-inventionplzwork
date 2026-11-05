@@ -809,70 +809,229 @@ def _strip_html(raw: str) -> str:
     return re.sub(r'\s+', ' ', text).strip()
 
 
-def save_quiz_txt(questions: list, out_path: str, title: str):
+def save_quiz_html(questions: list, out_path: str, title: str, watermark: str = ""):
+    """Save quiz as a styled HTML file with optional watermark branding."""
     if not questions:
         return None
-    out = f"{out_path}_quiz.txt"
+    out = f"{out_path}_quiz.html"
     try:
-        with open(out, "w", encoding="utf-8") as f:
-            f.write(f"Quiz: {title}\n")
-            f.write("═" * 60 + "\n\n")
-            opt_labels = ["A", "B", "C", "D", "E"]
-            for idx, q in enumerate(questions, 1):
-                q_text = _strip_html(
-                    q.get("question") or q.get("question_en")
-                    or q.get("que")   or q.get("title") or ""
-                )
-                f.write(f"Q{idx}. {q_text}\n")
-                options = []
-                for num in range(1, 6):
-                    raw_opt = q.get(f"option_{num}", "")
-                    clean   = _strip_html(raw_opt)
-                    if clean:
-                        label = opt_labels[num - 1] if num - 1 < len(opt_labels) else str(num)
-                        options.append((label, clean))
-                if not options:
-                    raw_list = q.get("options") or q.get("option") or []
-                    if isinstance(raw_list, list):
-                        for oi, opt in enumerate(raw_list):
-                            t = _strip_html(opt.get("text") or opt.get("option") or "" if isinstance(opt, dict) else str(opt))
-                            if t:
-                                label = opt_labels[oi] if oi < len(opt_labels) else str(oi + 1)
-                                options.append((label, t))
-                answer_raw = str(
-                    q.get("answer") or q.get("correct_answer")
-                    or q.get("correct_option") or q.get("correct") or ""
-                ).strip()
-                correct_label = ""
-                correct_text  = ""
-                try:
-                    ans_idx = int(answer_raw) - 1
-                    if 0 <= ans_idx < len(options):
-                        correct_label, correct_text = options[ans_idx]
-                except (ValueError, TypeError):
-                    for lbl, txt in options:
-                        if lbl == answer_raw.upper():
-                            correct_label, correct_text = lbl, txt
-                            break
+        opt_labels = ["A", "B", "C", "D", "E"]
+        cards_html = ""
+
+        for idx, q in enumerate(questions, 1):
+            q_text = _strip_html(
+                q.get("question") or q.get("question_en")
+                or q.get("que")   or q.get("title") or ""
+            )
+
+            options = []
+            for num in range(1, 6):
+                raw_opt = q.get(f"option_{num}", "")
+                clean   = _strip_html(raw_opt)
+                if clean:
+                    label = opt_labels[num - 1] if num - 1 < len(opt_labels) else str(num)
+                    options.append((label, clean))
+            if not options:
+                raw_list = q.get("options") or q.get("option") or []
+                if isinstance(raw_list, list):
+                    for oi, opt in enumerate(raw_list):
+                        t = _strip_html(opt.get("text") or opt.get("option") or "" if isinstance(opt, dict) else str(opt))
+                        if t:
+                            label = opt_labels[oi] if oi < len(opt_labels) else str(oi + 1)
+                            options.append((label, t))
+
+            answer_raw = str(
+                q.get("answer") or q.get("correct_answer")
+                or q.get("correct_option") or q.get("correct") or ""
+            ).strip()
+            correct_label = ""
+            correct_text  = ""
+            try:
+                ans_idx = int(answer_raw) - 1
+                if 0 <= ans_idx < len(options):
+                    correct_label, correct_text = options[ans_idx]
+            except (ValueError, TypeError):
                 for lbl, txt in options:
-                    marker = " ✓" if lbl == correct_label else ""
-                    f.write(f"   {lbl}) {txt}{marker}\n")
-                if correct_text:
-                    f.write(f"\n   ✓ Answer: {correct_label}) {correct_text}\n")
-                elif answer_raw:
-                    f.write(f"\n   ✓ Answer: Option {answer_raw}\n")
-                exp = _strip_html(q.get("solution_text") or q.get("explanation") or q.get("solution") or "")
-                if exp:
-                    f.write(f"   💡 {exp}\n")
-                cs = q.get("correct_score", "")
-                ns = q.get("negative_score", "")
-                if cs or ns:
-                    f.write(f"   [+{cs} / -{ns}]\n")
-                f.write("\n")
+                    if lbl == answer_raw.upper():
+                        correct_label, correct_text = lbl, txt
+                        break
+
+            opts_html = ""
+            for lbl, txt in options:
+                is_correct = lbl == correct_label
+                cls = "option correct" if is_correct else "option"
+                tick = " ✓" if is_correct else ""
+                opts_html += f'<div class="{cls}"><span class="opt-label">{lbl}</span>{txt}{tick}</div>\n'
+
+            exp = _strip_html(q.get("solution_text") or q.get("explanation") or q.get("solution") or "")
+            exp_html = f'<div class="explanation">💡 {exp}</div>' if exp else ""
+
+            cs = q.get("correct_score", "")
+            ns = q.get("negative_score", "")
+            marks_html = f'<div class="marks">+{cs} / -{ns}</div>' if (cs or ns) else ""
+
+            cards_html += f"""
+        <div class="card">
+            <div class="q-num">Q{idx}</div>
+            <div class="q-text">{q_text}</div>
+            {opts_html}
+            {exp_html}
+            {marks_html}
+        </div>"""
+
+        wm_html = ""
+        if watermark:
+            wm_html = f'<div class="watermark">{watermark}</div>'
+
+        html = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>{title}</title>
+<style>
+  * {{ box-sizing: border-box; margin: 0; padding: 0; }}
+  body {{
+    font-family: 'Segoe UI', Arial, sans-serif;
+    background: #0f0f1a;
+    color: #e0e0e0;
+    padding: 20px;
+    min-height: 100vh;
+  }}
+  .header {{
+    text-align: center;
+    padding: 24px 16px 12px;
+    background: linear-gradient(135deg, #1a1a2e, #16213e);
+    border-radius: 12px;
+    margin-bottom: 24px;
+    border: 1px solid #2a2a4a;
+  }}
+  .header h1 {{
+    font-size: 1.5rem;
+    color: #a78bfa;
+    margin-bottom: 6px;
+  }}
+  .header .meta {{
+    font-size: 0.85rem;
+    color: #888;
+  }}
+  .brand {{
+    display: inline-block;
+    margin-top: 8px;
+    font-size: 0.9rem;
+    color: #60a5fa;
+    font-weight: 600;
+    letter-spacing: 0.5px;
+  }}
+  .card {{
+    background: #1a1a2e;
+    border: 1px solid #2a2a4a;
+    border-radius: 12px;
+    padding: 20px;
+    margin-bottom: 18px;
+  }}
+  .q-num {{
+    font-size: 0.75rem;
+    font-weight: 700;
+    color: #a78bfa;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    margin-bottom: 8px;
+  }}
+  .q-text {{
+    font-size: 1rem;
+    color: #e2e8f0;
+    margin-bottom: 14px;
+    line-height: 1.6;
+  }}
+  .option {{
+    display: flex;
+    align-items: flex-start;
+    gap: 10px;
+    padding: 10px 14px;
+    border-radius: 8px;
+    margin-bottom: 8px;
+    background: #0f0f1a;
+    border: 1px solid #2a2a4a;
+    font-size: 0.93rem;
+    color: #cbd5e1;
+    line-height: 1.5;
+  }}
+  .option.correct {{
+    background: #052e16;
+    border-color: #16a34a;
+    color: #86efac;
+    font-weight: 600;
+  }}
+  .opt-label {{
+    font-weight: 700;
+    min-width: 22px;
+    color: #a78bfa;
+  }}
+  .option.correct .opt-label {{
+    color: #4ade80;
+  }}
+  .explanation {{
+    margin-top: 12px;
+    padding: 10px 14px;
+    background: #1e1b4b;
+    border-left: 3px solid #818cf8;
+    border-radius: 6px;
+    font-size: 0.88rem;
+    color: #c7d2fe;
+    line-height: 1.5;
+  }}
+  .marks {{
+    margin-top: 8px;
+    font-size: 0.8rem;
+    color: #64748b;
+    text-align: right;
+  }}
+  .watermark {{
+    position: fixed;
+    bottom: 18px;
+    right: 22px;
+    font-size: 0.85rem;
+    color: rgba(167,139,250,0.55);
+    font-weight: 600;
+    pointer-events: none;
+    z-index: 999;
+    letter-spacing: 0.5px;
+  }}
+  .footer {{
+    text-align: center;
+    padding: 16px;
+    font-size: 0.8rem;
+    color: #475569;
+    margin-top: 10px;
+  }}
+</style>
+</head>
+<body>
+{wm_html}
+<div class="header">
+  <h1>{title}</h1>
+  <div class="meta">{len(questions)} Questions</div>
+  {'<div class="brand">Extracted by ➤ ' + watermark + '</div>' if watermark else ''}
+</div>
+
+{cards_html}
+
+<div class="footer">Generated by AppX Downloader Bot</div>
+</body>
+</html>"""
+
+        with open(out, "w", encoding="utf-8") as f:
+            f.write(html)
         return out
     except Exception as e:
         print(f"[Quiz] save error: {e}")
         return None
+
+
+# Keep old name as alias so nothing breaks if called elsewhere
+def save_quiz_txt(questions: list, out_path: str, title: str, watermark: str = ""):
+    return save_quiz_html(questions, out_path, title, watermark)
 
 
 async def get_test_series_list(session, api_base, user_id, course_id, hdr) -> list:
@@ -1496,7 +1655,8 @@ async def download_test_series(bot_client: Client, m: Message,
                                course_dir: str,
                                channel_id: int = None,
                                cname: str = "",
-                               auto_all: bool = False):
+                               auto_all: bool = False,
+                               session_credit: str = ""):
     """
     Download test series.  auto_all=True skips the pick prompts and
     downloads every series / subject / test automatically (used by
@@ -1619,7 +1779,7 @@ async def download_test_series(bot_client: Client, m: Message,
                 await asyncio.sleep(0.5)
                 continue
 
-            qfile = save_quiz_txt(questions, out_path, tname)
+            qfile = save_quiz_html(questions, out_path, tname, watermark=session_credit)
             if qfile:
                 await bot_client.send_document(
                     channel_id,
@@ -1717,7 +1877,7 @@ async def run_lecture_loop(
             if want_quiz and quiz_id:
                 questions = await fetch_quiz(session, api_base, quiz_id, appx_user_id, hdr)
                 if questions:
-                    qfile = save_quiz_txt(questions, out_path, title)
+                    qfile = save_quiz_html(questions, out_path, title, watermark=session_credit)
                     if qfile:
                         await bot_client.send_document(
                             channel_id,
@@ -1866,9 +2026,11 @@ async def run_lecture_loop(
                         os.remove(pr)
             success += 1
         else:
+            # Pass want_pdf=False here so download_item doesn't save PDFs to
+            # disk silently — we'll send them ourselves below after the video.
             ok = await download_item(
                 vtitle or title, url, xor_key, vtype, out_path,
-                hdr=hdr, class_pdfs=class_pdfs, want_pdf=want_pdf,
+                hdr=hdr, class_pdfs=[], want_pdf=False,
                 all_candidates=all_candidates)
             if ok:
                 for ext in ["mp4", "mkv", "webm", "ts"]:
@@ -1878,12 +2040,30 @@ async def run_lecture_loop(
                             bot_client, m, cc, fpath, "/d", name,
                             prog_msg, channel_id, watermark_text=batch_watermark)
                         break
+                # Send class PDFs that belong to this lecture
+                if want_pdf and class_pdfs:
+                    for suffix, purl in class_pdfs:
+                        if not purl:
+                            continue
+                        pr = await download_pdf(purl, f"{out_path}{suffix}")
+                        if pr:
+                            await bot_client.send_document(channel_id, document=pr, caption=cc1)
+                            os.remove(pr)
                 success += 1
             else:
                 await bot_client.send_message(
                     channel_id,
                     f"⚠️ **Failed:** `{str(i).zfill(3)}) {title[:60]}`"
                 )
+                # Still try to send PDFs even if video failed
+                if want_pdf and class_pdfs:
+                    for suffix, purl in class_pdfs:
+                        if not purl:
+                            continue
+                        pr = await download_pdf(purl, f"{out_path}{suffix}")
+                        if pr:
+                            await bot_client.send_document(channel_id, document=pr, caption=cc1)
+                            os.remove(pr)
                 failed += 1
 
         await asyncio.sleep(1)
@@ -2006,9 +2186,9 @@ async def appx_main_flow(bot_client: Client, m: Message, user_id_tg: int):
                 await wm_ask.delete()
             batch_watermark = None if raw_wm == "/d" else raw_wm
 
-            # ── Per-user brand name for captions ──────────────────────────
+            # ── Per-user brand name for captions & HTML watermark ─────────
             brand_ask = await m.reply_text(
-                "**🏷️ Brand name for captions?**\n"
+                "**🏷️ Brand name for captions & HTML watermark?**\n"
                 "Send your brand/channel name (e.g. `@MyChannel`) or `/d` to use default.\n"
                 "_20s timeout → default:_"
             )
@@ -2035,7 +2215,8 @@ async def appx_main_flow(bot_client: Client, m: Message, user_id_tg: int):
                 await download_test_series(
                     bot_client, m, session, api_base,
                     appx_user_id, cid, hdr, course_dir,
-                    channel_id=channel_id, cname=cname)
+                    channel_id=channel_id, cname=cname,
+                    session_credit=session_credit)
                 continue
 
             # ══════════════════════════════════════════════════════
@@ -2140,7 +2321,8 @@ async def appx_main_flow(bot_client: Client, m: Message, user_id_tg: int):
                         bot_client, m, session, api_base,
                         appx_user_id, cid, hdr, course_dir,
                         channel_id=channel_id, cname=cname,
-                        auto_all=True   # ← skip all pick prompts
+                        auto_all=True,   # ← skip all pick prompts
+                        session_credit=session_credit
                     )
 
                 await bot_client.send_message(
